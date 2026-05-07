@@ -3,8 +3,8 @@
 Eye tracker visualization and CSV logger.
 
 This script provides a GUI to start/stop the SDK, visualize gaze and pupil
-signals, log samples to CSV, and perform calibration by clicking on the
-calibration canvas.
+signals, log samples to CSV, and perform calibration with predefined
+auto-advancing target points.
 """
 
 import argparse
@@ -16,7 +16,6 @@ import sys
 import time
 from collections import deque
 from datetime import datetime
-
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -28,6 +27,11 @@ DISPLAY_WINDOW_SECONDS = 10.0
 PLOT_UPDATE_INTERVAL_MS = 33
 METRIC_UPDATE_INTERVAL_MS = 250
 RATE_WINDOW_SECONDS = 3.0
+
+# Calibration timing (seconds)
+CALIB_POINT_SHOW_DELAY = 1.0      # Time to show target before collecting
+CALIB_POINT_COLLECT_TIME = 5.0    # Max time to wait for data collection at each point
+CALIB_POINT_TRANSITION = 0.5      # Brief pause between points
 
 COLUMN_NAMES = [
     "pc_timestamp",
@@ -75,6 +79,51 @@ def get_theme_colors():
     return THEME_DARK if detect_dark_theme() else THEME_LIGHT
 
 
+def get_calibration_points(n_points, scene_w, scene_h):
+    """Return list of (sdk_x, sdk_y) in SDK center-origin coordinates.
+    
+    SDK coordinate system: origin at center, X right positive, Y up positive.
+    Range: X in [-scene_w/2, +scene_w/2], Y in [-scene_h/2, +scene_h/2].
+    We use 80% of the range to avoid extreme edges.
+    """
+    margin_x = scene_w * 0.1
+    margin_y = scene_h * 0.1
+    half_w = scene_w / 2 - margin_x
+    half_h = scene_h / 2 - margin_y
+
+    if n_points == 1:
+        return [(0.0, 0.0)]
+    elif n_points == 3:
+        return [
+            (0.0, 0.0),
+            (half_w, half_h),
+            (-half_w, -half_h),
+        ]
+    elif n_points == 5:
+        return [
+            (0.0, 0.0),
+            (half_w, half_h),
+            (-half_w, half_h),
+            (-half_w, -half_h),
+            (half_w, -half_h),
+        ]
+    elif n_points == 9:
+        return [
+            (0.0, 0.0),
+            (half_w, half_h),
+            (-half_w, half_h),
+            (-half_w, -half_h),
+            (half_w, -half_h),
+            (half_w, 0.0),
+            (-half_w, 0.0),
+            (0.0, half_h),
+            (0.0, -half_h),
+        ]
+    else:
+        # Fallback: center only
+        return [(0.0, 0.0)]
+
+
 class PacketRateTracker:
     def __init__(self, window_seconds=RATE_WINDOW_SECONDS):
         self.window_seconds = window_seconds
@@ -108,7 +157,7 @@ class RingSeries:
         if not values:
             return
         if len(values) >= self.size:
-            values = values[-self.size :]
+            values = values[-self.size:]
         for value in values:
             self.values[self.write_index] = float(value)
             self.write_index = (self.write_index + 1) % self.size
@@ -118,8 +167,8 @@ class RingSeries:
         if self.count == 0:
             return []
         if self.count < self.size:
-            return self.values[: self.count]
-        return self.values[self.write_index :] + self.values[: self.write_index]
+            return self.values[:self.count]
+        return self.values[self.write_index:] + self.values[:self.write_index]
 
     def x_axis(self, count):
         if count <= 1:
@@ -189,51 +238,136 @@ class _CSVWriterWorker(QtCore.QObject):
 
 
 class CalibrationCanvas(QtWidgets.QWidget):
-    point_clicked = QtCore.Signal(float, float)
+    """Canvas that shows calibration targets and live gaze overlay."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(640, 360)
-        self._target_pos = None
-        self._gaze_pos = None
+        self._target_pos = None          # (canvas_x, canvas_y) or None
+        self._gaze_pos = None            # (canvas_x, canvas_y) or None
+        self._all_points = []            # list of (canvas_x, canvas_y) for all calibration points
+        self._collected_indices = set()  # indices of completed points
+        self._current_index = -1         # index of current point being shown
+        self._status_text = ""           # status string to display
+        self._countdown = -1             # countdown seconds, -1 = no countdown
         self._theme = get_theme_colors()
 
     def set_theme(self, theme):
         self._theme = theme
         self.update()
 
-    def set_target(self, x, y):
-        self._target_pos = (x, y)
+    def clear_calibration(self):
+        self._target_pos = None
+        self._all_points = []
+        self._collected_indices = set()
+        self._current_index = -1
+        self._status_text = ""
+        self._countdown = -1
+        self.update()
+
+    def setup_points(self, canvas_points):
+        """Set the list of all calibration point positions (canvas coords)."""
+        self._all_points = canvas_points
+        self._collected_indices = set()
+        self._current_index = -1
+        self._target_pos = None
+        self.update()
+
+    def show_point(self, index):
+        """Highlight the calibration point at the given index."""
+        self._current_index = index
+        if 0 <= index < len(self._all_points):
+            self._target_pos = self._all_points[index]
+        else:
+            self._target_pos = None
+        self.update()
+
+    def mark_collected(self, index):
+        """Mark a point as collected."""
+        self._collected_indices.add(index)
+        self.update()
+
+    def set_status(self, text):
+        self._status_text = text
+        self.update()
+
+    def set_countdown(self, seconds):
+        self._countdown = seconds
         self.update()
 
     def set_gaze(self, x, y):
         self._gaze_pos = (x, y)
         self.update()
 
-    def mousePressEvent(self, event):
-        if event.button() == QtCore.Qt.MouseButton.LeftButton:
-            pos = event.position() if hasattr(event, "position") else event.localPos()
-            self._target_pos = (pos.x(), pos.y())
-            self.point_clicked.emit(pos.x(), pos.y())
-            self.update()
-
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
         painter.fillRect(self.rect(), QtGui.QColor(self._theme["bg"]))
+        w = self.width()
+        h = self.height()
 
-        if self._target_pos:
-            self._draw_target(painter, self._target_pos, QtGui.QColor(self._theme["accent"]))
+        # Draw all calibration point markers (dim)
+        for i, (px, py) in enumerate(self._all_points):
+            if i in self._collected_indices:
+                color = QtGui.QColor("#4CAF50")  # green = done
+                r = 8
+            elif i == self._current_index:
+                color = QtGui.QColor(self._theme["accent"])
+                r = 14
+            else:
+                color = QtGui.QColor("#555555")
+                r = 6
+            painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+            painter.setPen(QtGui.QPen(color, 2))
+            painter.setBrush(QtGui.QBrush(QtGui.QColor(color.red(), color.green(), color.blue(), 80)))
+            painter.drawEllipse(QtCore.QPointF(px, py), r, r)
 
+        # Draw active target with crosshair
+        if self._target_pos and 0 <= self._current_index < len(self._all_points):
+            tx, ty = self._target_pos
+            accent = QtGui.QColor(self._theme["accent"])
+            painter.setPen(QtGui.QPen(accent, 2))
+            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            # Outer circle
+            painter.drawEllipse(QtCore.QPointF(tx, ty), 20, 20)
+            # Inner dot
+            painter.setBrush(QtGui.QBrush(accent))
+            painter.drawEllipse(QtCore.QPointF(tx, ty), 4, 4)
+            # Crosshair lines
+            painter.setPen(QtGui.QPen(accent, 1, QtCore.Qt.PenStyle.DashLine))
+            painter.drawLine(int(tx) - 30, int(ty), int(tx) - 22, int(ty))
+            painter.drawLine(int(tx) + 22, int(ty), int(tx) + 30, int(ty))
+            painter.drawLine(int(tx), int(ty) - 30, int(tx), int(ty) - 22)
+            painter.drawLine(int(tx), int(ty) + 22, int(tx), int(ty) + 30)
+
+        # Draw gaze point
         if self._gaze_pos:
-            self._draw_target(painter, self._gaze_pos, QtGui.QColor("#FFB347"), radius=6)
+            gx, gy = self._gaze_pos
+            gaze_color = QtGui.QColor("#FFB347")
+            painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+            painter.setPen(QtGui.QPen(gaze_color, 1))
+            painter.setBrush(QtGui.QBrush(gaze_color))
+            painter.drawEllipse(QtCore.QPointF(gx, gy), 5, 5)
 
-    def _draw_target(self, painter, pos, color, radius=10):
-        painter.save()
-        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-        painter.setPen(QtGui.QPen(color, 2))
-        painter.setBrush(QtGui.QBrush(QtGui.QColor(color.red(), color.green(), color.blue(), 120)))
-        painter.drawEllipse(QtCore.QPointF(pos[0], pos[1]), radius, radius)
-        painter.restore()
+        # Draw status text
+        if self._status_text:
+            painter.setPen(QtGui.QColor(self._theme["fg"]))
+            font = painter.font()
+            font.setPointSize(14)
+            font.setBold(True)
+            painter.setFont(font)
+            painter.drawText(QtCore.QRect(10, 10, w - 20, 40), QtCore.Qt.AlignmentFlag.AlignCenter, self._status_text)
+
+        # Draw countdown
+        if self._countdown >= 0:
+            painter.setPen(QtGui.QColor("#FFD166"))
+            font = painter.font()
+            font.setPointSize(28)
+            font.setBold(True)
+            painter.setFont(font)
+            painter.drawText(QtCore.QRect(10, h - 60, w - 20, 50),
+                             QtCore.Qt.AlignmentFlag.AlignCenter, str(self._countdown))
+
+        painter.end()
 
 
 class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
@@ -260,12 +394,21 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         self.last_plot_update = 0.0
         self.last_metric_update = 0.0
         self.latest_sample = None
-        self.current_points = 0
-        self.finish_points = [[1, 1], [1, 1], [1, 1]]
 
         self.scene_width = 1280
         self.scene_height = 720
         self.sdk_running = False
+
+        # Calibration state
+        self.calib_active = False
+        self.calib_points_sdk = []       # SDK coords (center-origin)
+        self.calib_points_canvas = []    # Canvas pixel coords
+        self.calib_current_idx = 0
+        self.calib_n_points = 0
+        self.calib_finish_count = 0      # how many finish callbacks received for current point
+        self.calib_expected_finish = 2   # left + right eye
+        self.calib_timer = None          # QTimer for auto-advance
+        self.calib_point_done = False    # guard against double-advance
 
         self.theme = get_theme_colors()
         self._build_ui()
@@ -344,6 +487,8 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         self.points_combo = QtWidgets.QComboBox()
         self.points_combo.addItem("1 point", 1)
         self.points_combo.addItem("3 points", 3)
+        self.points_combo.addItem("5 points", 5)
+        self.points_combo.addItem("9 points", 9)
         calibration_layout.addWidget(QtWidgets.QLabel("Points"))
         calibration_layout.addWidget(self.points_combo)
 
@@ -354,7 +499,7 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         calibration_layout.addWidget(self.calibrate_button)
         calibration_layout.addWidget(self.stop_calibration_button)
 
-        self.calibration_hint = QtWidgets.QLabel("Click on the canvas to place the target")
+        self.calibration_hint = QtWidgets.QLabel("Look at each target point as it appears.\nCalibration runs automatically.")
         self.calibration_hint.setWordWrap(True)
         calibration_layout.addWidget(self.calibration_hint)
 
@@ -402,7 +547,7 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         right_panel.addWidget(self.gaze_plot, stretch=1)
         right_panel.addWidget(self.pupil_plot, stretch=1)
 
-        canvas_group = QtWidgets.QGroupBox("Calibration Canvas")
+        canvas_group = QtWidgets.QGroupBox("Calibration Canvas / Gaze Overlay")
         canvas_layout = QtWidgets.QVBoxLayout(canvas_group)
         self.canvas = CalibrationCanvas()
         self.canvas.set_theme(self.theme)
@@ -413,7 +558,8 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         self.stop_button.clicked.connect(self._on_stop)
         self.calibrate_button.clicked.connect(self._on_start_calibration)
         self.stop_calibration_button.clicked.connect(self._on_stop_calibration)
-        self.canvas.point_clicked.connect(self._on_canvas_clicked)
+
+    # ---- SDK start / stop ----
 
     def _on_start(self):
         pwd = self._read_pwd()
@@ -458,6 +604,8 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         self.timer.start()
 
     def _on_stop(self):
+        if self.calib_active:
+            self._abort_calibration()
         if self.sdk_running:
             self.sdk.stop()
         self.sdk_running = False
@@ -471,47 +619,158 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         self.calibrate_button.setEnabled(False)
         self.stop_calibration_button.setEnabled(False)
 
+    # ---- Calibration ----
+
+    def _sdk_to_canvas(self, sdk_x, sdk_y):
+        """Convert SDK center-origin coords to canvas pixel coords."""
+        canvas_w = max(1, self.canvas.width())
+        canvas_h = max(1, self.canvas.height())
+        # SDK: origin center, Y up. Canvas: origin top-left, Y down.
+        cx = (sdk_x + self.scene_width / 2) / self.scene_width * canvas_w
+        cy = (self.scene_height / 2 - sdk_y) / self.scene_height * canvas_h
+        return cx, cy
+
     def _on_start_calibration(self):
         if not self.sdk_running:
             return
-        self.current_points = self.points_combo.currentData()
-        self._reset_finish_points()
-        self.sdk.start_calibration(self.current_points)
+
+        self.calib_n_points = self.points_combo.currentData()
+        self.calib_points_sdk = get_calibration_points(
+            self.calib_n_points, self.scene_width, self.scene_height
+        )
+        # Convert to canvas coords
+        self.calib_points_canvas = [
+            self._sdk_to_canvas(sx, sy) for sx, sy in self.calib_points_sdk
+        ]
+
+        self.canvas.setup_points(self.calib_points_canvas)
+        self.calib_current_idx = 0
+        self.calib_active = True
+        self.calib_finish_count = 0
+
         self.calibrate_button.setEnabled(False)
         self.stop_calibration_button.setEnabled(True)
+        self.calibration_hint.setText("Calibration starting...\nLook at each target point.")
 
-    def _on_stop_calibration(self):
-        self.sdk.stop_calibration()
-        self.calibrate_button.setEnabled(True)
-        self.stop_calibration_button.setEnabled(False)
+        # Start the SDK calibration thread (it waits for set_current_point events)
+        self.sdk.start_calibration(self.calib_n_points)
 
-    def _on_canvas_clicked(self, x, y):
-        if not self.sdk_running:
+        # Begin showing the first point after a short delay
+        self.calib_timer = QtCore.QTimer(self)
+        self.calib_timer.setSingleShot(True)
+        self.calib_timer.timeout.connect(self._calib_show_current_point)
+        self.calib_timer.start(500)
+
+    def _calib_show_current_point(self):
+        """Show the current calibration target and start countdown."""
+        if not self.calib_active:
             return
-        canvas_w = max(1, self.canvas.width())
-        canvas_h = max(1, self.canvas.height())
-        scale_x = self.scene_width / canvas_w
-        scale_y = self.scene_height / canvas_h
+        if self.calib_current_idx >= self.calib_n_points:
+            # All points done - wait for SDK thread to finish computing
+            self.canvas.set_status("Computing calibration...")
+            self.canvas.set_countdown(-1)
+            self.calibration_hint.setText("Processing calibration data...")
+            return
 
-        # Invert Y logic: SDK treats upward as positive Y, but UI treats downward as positive
-        point_x = float(x * scale_x) - float(self.scene_width / 2)
-        point_y = float(self.scene_height / 2) - float(y * scale_y) 
-        self.sdk.set_current_point(point_x, point_y)
+        idx = self.calib_current_idx
+        self.canvas.show_point(idx)
+        self.canvas.set_status(f"Point {idx + 1}/{self.calib_n_points} - Get ready!")
+        self.canvas.set_countdown(-1)
+        self.calibration_hint.setText(
+            f"Point {idx + 1}/{self.calib_n_points}\nLook at the target..."
+        )
+
+        # After CALIB_POINT_SHOW_DELAY, start collecting
+        self.calib_timer = QtCore.QTimer(self)
+        self.calib_timer.setSingleShot(True)
+        self.calib_timer.timeout.connect(self._calib_start_collecting)
+        self.calib_timer.start(int(CALIB_POINT_SHOW_DELAY * 1000))
+
+    def _calib_start_collecting(self):
+        """Send the current point to the SDK and start countdown."""
+        if not self.calib_active:
+            return
+        idx = self.calib_current_idx
+        sdk_x, sdk_y = self.calib_points_sdk[idx]
+
+        self.calib_finish_count = 0
+        self.calib_point_done = False
+        self.sdk.set_current_point(sdk_x, sdk_y)
+
+        self.canvas.set_status(f"Point {idx + 1}/{self.calib_n_points} - Collecting...")
+        self.calibration_hint.setText(
+            f"Point {idx + 1}/{self.calib_n_points}\nKeep looking at the target!"
+        )
+
+        # Start countdown
+        self._calib_countdown_remaining = int(CALIB_POINT_COLLECT_TIME)
+        self.canvas.set_countdown(self._calib_countdown_remaining)
+        self.calib_timer = QtCore.QTimer(self)
+        self.calib_timer.timeout.connect(self._calib_countdown_tick)
+        self.calib_timer.start(1000)
+
+    def _calib_countdown_tick(self):
+        """Tick the countdown. When it reaches 0, advance (timeout fallback)."""
+        self._calib_countdown_remaining -= 1
+        if self._calib_countdown_remaining <= 0:
+            self.calib_timer.stop()
+            self.canvas.set_countdown(-1)
+            if not self.calib_point_done:
+                self._calib_advance_to_next()
+        else:
+            self.canvas.set_countdown(self._calib_countdown_remaining)
+
+    def _calib_advance_to_next(self):
+        """Move to the next calibration point."""
+        # Mark current as collected
+        self.canvas.mark_collected(self.calib_current_idx)
+        self.calib_current_idx += 1
+
+        if self.calib_current_idx >= self.calib_n_points:
+            # All points sent - wait for SDK thread to finish
+            self.canvas.set_status("All points collected. Computing...")
+            self.calibration_hint.setText("All points done.\nWaiting for computation...")
+        else:
+            # Brief transition then show next point
+            self.canvas.set_status("")
+            self.calib_timer = QtCore.QTimer(self)
+            self.calib_timer.setSingleShot(True)
+            self.calib_timer.timeout.connect(self._calib_show_current_point)
+            self.calib_timer.start(int(CALIB_POINT_TRANSITION * 1000))
 
     def _on_calibration_finish(self, eye, index, error):
-        self.finish_points[index - 1][eye] = error
-        if self.current_points == 1:
-            if self.finish_points[0][0] != 1 and self.finish_points[0][1] != 1:
-                self._on_stop_calibration()
-        elif self.current_points == 3:
-            done = all(self.finish_points[i][0] != 1 and self.finish_points[i][1] != 1 for i in range(3))
-            if done:
-                self._on_stop_calibration()
+        """Called when SDK finishes collecting a calibration point for one eye."""
+        print(f"calibration finish: eye={eye} index={index} error={error}")
+        if not self.calib_active or self.calib_point_done:
+            return
+        self.calib_finish_count += 1
 
-    def _reset_finish_points(self):
-        for i in range(3):
-            self.finish_points[i][0] = 1
-            self.finish_points[i][1] = 1
+        # When both eyes finish, advance immediately and cancel timeout
+        if self.calib_finish_count >= self.calib_expected_finish:
+            self.calib_point_done = True
+            if self.calib_timer:
+                self.calib_timer.stop()
+            self.canvas.set_countdown(-1)
+            if self.calib_current_idx < self.calib_n_points:
+                self._calib_advance_to_next()
+
+    def _on_stop_calibration(self):
+        """User clicked stop calibration."""
+        self._abort_calibration()
+
+    def _abort_calibration(self):
+        """Cancel any in-progress calibration."""
+        self.calib_active = False
+        if self.calib_timer:
+            self.calib_timer.stop()
+            self.calib_timer = None
+        self.sdk.stop_calibration()
+        self.canvas.clear_calibration()
+        self.calibration_hint.setText("Calibration cancelled.")
+        self.calibrate_button.setEnabled(self.sdk_running)
+        self.stop_calibration_button.setEnabled(False)
+
+    # ---- Timer / data ----
 
     def _on_timer(self):
         now = time.perf_counter()
@@ -551,8 +810,7 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
     def _update_canvas_gaze(self, sample):
         canvas_w = max(1, self.canvas.width())
         canvas_h = max(1, self.canvas.height())
-        
-        # Invert Y logic back to UI coordinates (upward gaze yields positive SDK Y)
+        # SDK: origin center, Y up. Canvas: origin top-left, Y down.
         x = (sample["gaze_x"] + self.scene_width / 2) / self.scene_width * canvas_w
         y = (self.scene_height / 2 - sample["gaze_y"]) / self.scene_height * canvas_h
         self.canvas.set_gaze(x, y)
@@ -577,7 +835,9 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         self.rate_label.setText(f"Rate: {rate:.1f} Hz")
         self.count_label.setText(f"Samples: {self.packet_count}")
         if self.latest_sample:
-            self.gaze_value.setText(f"{self.latest_sample['gaze_x']:.1f}, {self.latest_sample['gaze_y']:.1f}")
+            self.gaze_value.setText(
+                f"{self.latest_sample['gaze_x']:.1f}, {self.latest_sample['gaze_y']:.1f}"
+            )
             self.left_pupil_value.setText(
                 f"{self.latest_sample['left_pupil_x']:.1f}, {self.latest_sample['left_pupil_y']:.1f}"
             )
@@ -599,6 +859,8 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         return pwd.encode("utf-8")
 
     def closeEvent(self, event):
+        if self.calib_active:
+            self._abort_calibration()
         if self.sdk_running:
             self._on_stop()
             time.sleep(1)

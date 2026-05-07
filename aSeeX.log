@@ -1,28 +1,36 @@
-[2026-05-07 15:57:12]: load base_coe.dat OK.
-[2026-05-07 15:57:12]: config_path: E:/7invensun/aSeeGlassesPlusUserSDK\bin\config
-[2026-05-07 15:57:12]: init sdk: 0
-[2026-05-07 15:57:12]: version: 130.20260203.1426-8208-100033-20250527_0_0_0_0_GETVIVO-250820AGP3o@GOB5F27D0821-FD.AGP3PLUS.240.20251208.02
-[2026-05-07 15:57:12]: set data: 0 240
-[2026-05-07 15:57:13]: 0 1280 720 100 0
-[2026-05-07 15:57:13]: start camera: 0
-[2026-05-07 15:57:13]: set front camera gamma: 0
-[2026-05-07 15:57:13]: start gaze callback_ex: 0
-[2026-05-07 15:57:15]: start calibration: 1 0
-[2026-05-07 15:57:15]: set default calibration L: 0 -640.000000 640.000000 -360.000000 360.000000
-[2026-05-07 15:57:15]: set default calibration R: 0 -640.000000 640.000000 -360.000000 360.000000
-[2026-05-07 15:57:20]: compute calibration: 1 0
-[2026-05-07 15:57:20]: compute calibration: 2 0
-[2026-05-07 15:57:20]: compute calibration: -3
-[2026-05-07 15:57:23]: start calibration: 3 0
-[2026-05-07 15:57:23]: set default calibration L: 0 -640.000000 640.000000 -360.000000 360.000000
-[2026-05-07 15:57:23]: set default calibration R: 0 -640.000000 640.000000 -360.000000 360.000000
-[2026-05-07 15:57:26]: start calibration point: 1 1 1.12 0.67 0
-[2026-05-07 15:57:26]: start calibration point: 2 1 1.12 0.67 0
-[2026-05-07 15:57:31]: start calibration point: 1 2 578.83 290.00 0
-[2026-05-07 15:57:31]: start calibration point: 2 2 578.83 290.00 0
-[2026-05-07 15:57:37]: start calibration point: 1 3 -617.25 -323.33 0
-[2026-05-07 15:57:37]: start calibration point: 2 3 -617.25 -323.33 0
-[2026-05-07 15:57:41]: compute calibration: 1 0
-[2026-05-07 15:57:41]: compute calibration: 2 0
-[2026-05-07 15:57:41]: compute calibration: -3
-[2026-05-07 15:58:20]: release: 0
+[2026-05-07 16:23:54]: load base_coe.dat OK.
+[2026-05-07 16:23:55]: config_path: E:/7invensun/aSeeGlassesPlusUserSDK\bin\config
+[2026-05-07 16:23:55]: init sdk: 0
+[2026-05-07 16:23:55]: version: 130.20260203.1426-8208-100033-20250527_0_0_0_0_GETVIVO-250820AGP3o@GOB5F27D0821-FD.AGP3PLUS.240.20251208.02
+[2026-05-07 16:23:55]: set data: 0 240
+[2026-05-07 16:23:56]: 0 1280 720 100 0
+[2026-05-07 16:23:56]: start camera: 0
+[2026-05-07 16:23:56]: set front camera gamma: 0
+[2026-05-07 16:23:56]: start gaze callback_ex: 0
+[2026-05-07 16:23:57]: start calibration: 1 0
+[2026-05-07 16:23:57]: set default calibration L: 0 -640.000000 640.000000 -360.000000 360.000000
+[2026-05-07 16:23:57]: set default calibration R: 0 -640.000000 640.000000 -360.000000 360.000000
+[2026-05-07 16:23:59]: start calibration point: 1 1 0.00 0.00 0
+[2026-05-07 16:23:59]: start calibration point: 2 1 0.00 0.00 0
+[2026-05-07 16:24:02]: compute calibration: 1 0
+[2026-05-07 16:24:02]: compute calibration: 2 0
+[2026-05-07 16:24:02]: compute calibration: 0
+[2026-05-07 16:24:20]: start calibration: 3 0
+[2026-05-07 16:24:20]: set default calibration L: 0 -640.000000 640.000000 -360.000000 360.000000
+[2026-05-07 16:24:20]: set default calibration R: 0 -640.000000 640.000000 -360.000000 360.000000
+[2026-05-07 16:24:22]: start calibration point: 1 1 0.00 0.00 0
+[2026-05-07 16:24:22]: start calibration point: 2 1 0.00 0.00 0
+[2026-05-07 16:24:23]: start calibration point: 1 2 512.00 288.00 0
+[2026-05-07 16:24:23]: start calibration point: 2 2 512.00 288.00 0
+[2026-05-07 16:24:25]: start calibration point: 1 3 -512.00 -288.00 0
+[2026-05-07 16:24:25]: start calibration point: 2 3 -512.00 -288.00 0
+[2026-05-07 16:24:28]: compute calibration: 1 0
+[2026-05-07 16:24:28]: compute calibration: 2 0
+[2026-05-07 16:24:28]: compute calibration: -3
+[2026-05-07 16:24:50]: start calibration: 1 0
+[2026-05-07 16:24:50]: set default calibration L: 0 -640.000000 640.000000 -360.000000 360.000000
+[2026-05-07 16:24:50]: set default calibration R: 0 -640.000000 640.000000 -360.000000 360.000000
+[2026-05-07 16:25:07]: compute calibration: 1 0
+[2026-05-07 16:25:07]: compute calibration: 2 0
+[2026-05-07 16:25:07]: compute calibration: -3
+[2026-05-07 16:25:07]: release: 0

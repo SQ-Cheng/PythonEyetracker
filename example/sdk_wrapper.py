@@ -119,7 +119,7 @@ class wrapper:
         self.py_gaze_cb = func_gaze_callback_t(wrapper.gaze_callback)
         self.py_left_point_process_cb = func_point_process_callback_t(wrapper.left_point_process_callback)
         self.py_left_point_finish_cb = func_point_finish_callback_t(wrapper.left_point_finish_callback)
-        self.py_right_point_process_cb = func_point_finish_callback_t(wrapper.right_point_process_callback)
+        self.py_right_point_process_cb = func_point_process_callback_t(wrapper.right_point_process_callback)
         self.py_right_point_finish_cb = func_point_finish_callback_t(wrapper.right_point_finish_callback)
         self.data_queue = queue.Queue()
 
@@ -157,7 +157,33 @@ class wrapper:
         print('sdk config path:%s' % self.sdk_config_path)
         ret = self.sdk_dll_handle._7i_start(self.sdk_config_path, environment, resolution, enable_gyroscope)
         print('_7i_start:%d' % ret)
+
+        if ret == 0:
+            self._load_base_coefficients()
+
         return ret
+
+    def _load_base_coefficients(self):
+        try:
+            if isinstance(self.sdk_config_path, bytes):
+                config_dir = self.sdk_config_path.decode("utf-8")
+            else:
+                config_dir = self.sdk_config_path
+            base_coe_path = os.path.join(config_dir, "base_coe.dat")
+            if not os.path.isfile(base_coe_path):
+                print("[WARN] base_coe.dat not found at %s" % base_coe_path)
+                return
+            coe = py_7i_coefficient_t()
+            with open(base_coe_path, "rb") as f:
+                data = f.read(1024)
+            memmove(coe.buf, data, len(data))
+            left_buf_len = c_int(1024)
+            ret1 = self.sdk_dll_handle._7i_set_data(b'biLeft', len(b'biLeft'), coe.buf, left_buf_len)
+            right_buf_len = c_int(1024)
+            ret2 = self.sdk_dll_handle._7i_set_data(b'biRight', len(b'biRight'), coe.buf, right_buf_len)
+            print("_7i_set_data base_coe: L=%d R=%d" % (ret1, ret2))
+        except Exception as e:
+            print("[WARN] Failed to load base coefficients: %s" % e)
 
     def stop(self):
         ret = self.sdk_dll_handle._7i_stop()
