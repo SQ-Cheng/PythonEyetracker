@@ -2,9 +2,9 @@
 """
 Eye tracker visualization and CSV logger.
 
-This script provides a GUI to start/stop the SDK, visualize gaze and pupil
-signals, log samples to CSV, and perform calibration with predefined
-auto-advancing target points.
+Adapted from the official aSeeGlassesPlus SDK Python3 sample.
+Uses PyQt5 with direct signal emission from SDK callbacks for reliable
+scene camera display, eye image display, and gaze overlay.
 """
 
 import argparse
@@ -16,22 +16,20 @@ import sys
 import time
 from collections import deque
 from datetime import datetime
-import pyqtgraph as pg
-from PySide6 import QtCore, QtGui, QtWidgets
+
+from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtGui import QPainter, QColor, QBrush, QPen, QPixmap, QFont
+from PyQt5.QtCore import Qt, QRectF
 
 from sdk_types import PY_7I_ENVIRONMENT, PY_7I_RESOLUTION
 from sdk_wrapper import wrapper
+import pyqtgraph as pg
 
 
 DISPLAY_WINDOW_SECONDS = 10.0
 PLOT_UPDATE_INTERVAL_MS = 33
 METRIC_UPDATE_INTERVAL_MS = 250
 RATE_WINDOW_SECONDS = 3.0
-
-# Calibration timing (seconds)
-CALIB_POINT_SHOW_DELAY = 1.0      # Time to show target before collecting
-CALIB_POINT_COLLECT_TIME = 5.0    # Max time to wait for data collection at each point
-CALIB_POINT_TRANSITION = 0.5      # Brief pause between points
 
 COLUMN_NAMES = [
     "pc_timestamp",
@@ -51,77 +49,21 @@ COLUMN_NAMES = [
     "right_blink",
 ]
 
-THEME_DARK = {
-    "bg": "#12161C",
-    "fg": "#EAF0F7",
-    "grid_alpha": 0.2,
-    "label_color": "#EAF0F7",
-    "accent": "#4ED1A6",
-}
 
-THEME_LIGHT = {
-    "bg": "#FFFFFF",
-    "fg": "#1A1A2E",
-    "grid_alpha": 0.3,
-    "label_color": "#1A1A2E",
-    "accent": "#2F6BFF",
-}
+class SceneImageLabel(QtWidgets.QLabel):
+    """Clickable QLabel for scene camera image (matching official sample)."""
 
+    button_clicked_signal = QtCore.pyqtSignal(int, int)
 
-def detect_dark_theme():
-    palette = QtWidgets.QApplication.instance().palette()
-    window_color = palette.color(QtGui.QPalette.ColorRole.Window)
-    luminance = 0.299 * window_color.redF() + 0.587 * window_color.greenF() + 0.114 * window_color.blueF()
-    return luminance < 0.5
+    def __init__(self, parent=None):
+        super(SceneImageLabel, self).__init__(parent)
 
+    def mousePressEvent(self, ev):
+        if ev.buttons() == Qt.LeftButton:
+            self.button_clicked_signal.emit(ev.x(), ev.y())
 
-def get_theme_colors():
-    return THEME_DARK if detect_dark_theme() else THEME_LIGHT
-
-
-def get_calibration_points(n_points, scene_w, scene_h):
-    """Return list of (sdk_x, sdk_y) in SDK center-origin coordinates.
-    
-    SDK coordinate system: origin at center, X right positive, Y up positive.
-    Range: X in [-scene_w/2, +scene_w/2], Y in [-scene_h/2, +scene_h/2].
-    We use 80% of the range to avoid extreme edges.
-    """
-    margin_x = scene_w * 0.1
-    margin_y = scene_h * 0.1
-    half_w = scene_w / 2 - margin_x
-    half_h = scene_h / 2 - margin_y
-
-    if n_points == 1:
-        return [(0.0, 0.0)]
-    elif n_points == 3:
-        return [
-            (0.0, 0.0),
-            (half_w, half_h),
-            (-half_w, -half_h),
-        ]
-    elif n_points == 5:
-        return [
-            (0.0, 0.0),
-            (half_w, half_h),
-            (-half_w, half_h),
-            (-half_w, -half_h),
-            (half_w, -half_h),
-        ]
-    elif n_points == 9:
-        return [
-            (0.0, 0.0),
-            (half_w, half_h),
-            (-half_w, half_h),
-            (-half_w, -half_h),
-            (half_w, -half_h),
-            (half_w, 0.0),
-            (-half_w, 0.0),
-            (0.0, half_h),
-            (0.0, -half_h),
-        ]
-    else:
-        # Fallback: center only
-        return [(0.0, 0.0)]
+    def connect_customized_slot(self, slot_func):
+        self.button_clicked_signal.connect(slot_func)
 
 
 class PacketRateTracker:
@@ -237,141 +179,15 @@ class _CSVWriterWorker(QtCore.QObject):
                 writer.writerow(row)
 
 
-class CalibrationCanvas(QtWidgets.QWidget):
-    """Canvas that shows calibration targets and live gaze overlay."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMinimumSize(640, 360)
-        self._target_pos = None          # (canvas_x, canvas_y) or None
-        self._gaze_pos = None            # (canvas_x, canvas_y) or None
-        self._all_points = []            # list of (canvas_x, canvas_y) for all calibration points
-        self._collected_indices = set()  # indices of completed points
-        self._current_index = -1         # index of current point being shown
-        self._status_text = ""           # status string to display
-        self._countdown = -1             # countdown seconds, -1 = no countdown
-        self._theme = get_theme_colors()
-
-    def set_theme(self, theme):
-        self._theme = theme
-        self.update()
-
-    def clear_calibration(self):
-        self._target_pos = None
-        self._all_points = []
-        self._collected_indices = set()
-        self._current_index = -1
-        self._status_text = ""
-        self._countdown = -1
-        self.update()
-
-    def setup_points(self, canvas_points):
-        """Set the list of all calibration point positions (canvas coords)."""
-        self._all_points = canvas_points
-        self._collected_indices = set()
-        self._current_index = -1
-        self._target_pos = None
-        self.update()
-
-    def show_point(self, index):
-        """Highlight the calibration point at the given index."""
-        self._current_index = index
-        if 0 <= index < len(self._all_points):
-            self._target_pos = self._all_points[index]
-        else:
-            self._target_pos = None
-        self.update()
-
-    def mark_collected(self, index):
-        """Mark a point as collected."""
-        self._collected_indices.add(index)
-        self.update()
-
-    def set_status(self, text):
-        self._status_text = text
-        self.update()
-
-    def set_countdown(self, seconds):
-        self._countdown = seconds
-        self.update()
-
-    def set_gaze(self, x, y):
-        self._gaze_pos = (x, y)
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QtGui.QPainter(self)
-        painter.fillRect(self.rect(), QtGui.QColor(self._theme["bg"]))
-        w = self.width()
-        h = self.height()
-
-        # Draw all calibration point markers (dim)
-        for i, (px, py) in enumerate(self._all_points):
-            if i in self._collected_indices:
-                color = QtGui.QColor("#4CAF50")  # green = done
-                r = 8
-            elif i == self._current_index:
-                color = QtGui.QColor(self._theme["accent"])
-                r = 14
-            else:
-                color = QtGui.QColor("#555555")
-                r = 6
-            painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-            painter.setPen(QtGui.QPen(color, 2))
-            painter.setBrush(QtGui.QBrush(QtGui.QColor(color.red(), color.green(), color.blue(), 80)))
-            painter.drawEllipse(QtCore.QPointF(px, py), r, r)
-
-        # Draw active target with crosshair
-        if self._target_pos and 0 <= self._current_index < len(self._all_points):
-            tx, ty = self._target_pos
-            accent = QtGui.QColor(self._theme["accent"])
-            painter.setPen(QtGui.QPen(accent, 2))
-            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-            # Outer circle
-            painter.drawEllipse(QtCore.QPointF(tx, ty), 20, 20)
-            # Inner dot
-            painter.setBrush(QtGui.QBrush(accent))
-            painter.drawEllipse(QtCore.QPointF(tx, ty), 4, 4)
-            # Crosshair lines
-            painter.setPen(QtGui.QPen(accent, 1, QtCore.Qt.PenStyle.DashLine))
-            painter.drawLine(int(tx) - 30, int(ty), int(tx) - 22, int(ty))
-            painter.drawLine(int(tx) + 22, int(ty), int(tx) + 30, int(ty))
-            painter.drawLine(int(tx), int(ty) - 30, int(tx), int(ty) - 22)
-            painter.drawLine(int(tx), int(ty) + 22, int(tx), int(ty) + 30)
-
-        # Draw gaze point
-        if self._gaze_pos:
-            gx, gy = self._gaze_pos
-            gaze_color = QtGui.QColor("#FFB347")
-            painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-            painter.setPen(QtGui.QPen(gaze_color, 1))
-            painter.setBrush(QtGui.QBrush(gaze_color))
-            painter.drawEllipse(QtCore.QPointF(gx, gy), 5, 5)
-
-        # Draw status text
-        if self._status_text:
-            painter.setPen(QtGui.QColor(self._theme["fg"]))
-            font = painter.font()
-            font.setPointSize(14)
-            font.setBold(True)
-            painter.setFont(font)
-            painter.drawText(QtCore.QRect(10, 10, w - 20, 40), QtCore.Qt.AlignmentFlag.AlignCenter, self._status_text)
-
-        # Draw countdown
-        if self._countdown >= 0:
-            painter.setPen(QtGui.QColor("#FFD166"))
-            font = painter.font()
-            font.setPointSize(28)
-            font.setBold(True)
-            painter.setFont(font)
-            painter.drawText(QtCore.QRect(10, h - 60, w - 20, 50),
-                             QtCore.Qt.AlignmentFlag.AlignCenter, str(self._countdown))
-
-        painter.end()
-
-
 class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
-    set_calibration_finish_signal = QtCore.Signal(int, int, int)
+    # Signals matching official sample pattern
+    set_sdk_running_signal = QtCore.pyqtSignal(bool)
+    set_pupil_center_signal = QtCore.pyqtSignal(float, float, float, float)
+    set_gaze_signal = QtCore.pyqtSignal(float, float)
+    set_scene_image_signal = QtCore.pyqtSignal(QPixmap)
+    set_left_eye_image_signal = QtCore.pyqtSignal(QPixmap)
+    set_right_eye_image_signal = QtCore.pyqtSignal(QPixmap)
+    set_calibration_finish_signal = QtCore.pyqtSignal(int, int, int)
 
     def __init__(self, sdk_root, sample_rate_hz, window_seconds):
         super().__init__()
@@ -399,21 +215,18 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         self.scene_height = 720
         self.sdk_running = False
 
-        # Calibration state
-        self.calib_active = False
-        self.calib_points_sdk = []       # SDK coords (center-origin)
-        self.calib_points_canvas = []    # Canvas pixel coords
-        self.calib_current_idx = 0
-        self.calib_n_points = 0
-        self.calib_finish_count = 0      # how many finish callbacks received for current point
-        self.calib_expected_finish = 2   # left + right eye
-        self.calib_timer = None          # QTimer for auto-advance
-        self.calib_point_done = False    # guard against double-advance
+        # Gaze position for overlay (in scene image coordinates)
+        self.cur_gaze_x = 0
+        self.cur_gaze_y = 0
 
-        self.theme = get_theme_colors()
+        # Calibration state (matching official sample pattern)
+        self.calibration_is_running = False
+        self.current_points = 0
+        self.finish_points = [[1, 1], [1, 1], [1, 1], [1, 1], [1, 1],
+                              [1, 1], [1, 1], [1, 1], [1, 1]]
+
         self._build_ui()
-
-        self.set_calibration_finish_signal.connect(self._on_calibration_finish)
+        self._connect_signals()
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._on_timer)
@@ -422,355 +235,368 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         self.csv_writer = None
 
     def _build_ui(self):
-        pg.setConfigOptions(antialias=False, useOpenGL=False,
-                            background=self.theme["bg"], foreground=self.theme["fg"])
-
-        self.setWindowTitle("Eye Tracker Visual Logger")
-        self.resize(1400, 900)
+        self.setWindowTitle("Eye Tracker Monitor")
+        self.resize(1450, 734)
 
         central = QtWidgets.QWidget(self)
         self.setCentralWidget(central)
-        root = QtWidgets.QVBoxLayout(central)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(10)
 
-        metrics_layout = QtWidgets.QHBoxLayout()
-        metrics_layout.setSpacing(20)
-        root.addLayout(metrics_layout)
+        # === Left sidebar (narrow, matching official sample layout) ===
+        # Environment group
+        self.groupBox_env = QtWidgets.QGroupBox("Environment")
+        self.groupBox_env.setGeometry(3, -1, 120, 41)
+        self.comboBoxEnvironment = QtWidgets.QComboBox(self.groupBox_env)
+        self.comboBoxEnvironment.setGeometry(10, 13, 100, 22)
+        self.comboBoxEnvironment.addItem("indoor", 301)
+        self.comboBoxEnvironment.addItem("outdoor", 302)
+        self.comboBoxEnvironment.addItem("darkness", 303)
+        self.comboBoxEnvironment.setCurrentIndex(0)
 
+        # Resolution group
+        self.groupBox_res = QtWidgets.QGroupBox("Resolution")
+        self.groupBox_res.setGeometry(3, 40, 121, 41)
+        self.comboBoxResolution = QtWidgets.QComboBox(self.groupBox_res)
+        self.comboBoxResolution.setGeometry(10, 12, 100, 22)
+        self.comboBoxResolution.addItem("1280 * 960", 201)
+        self.comboBoxResolution.addItem("1280 * 720", 202)
+        self.comboBoxResolution.addItem(" 800 * 600", 203)
+        self.comboBoxResolution.addItem("1920 * 1080", 204)
+        self.comboBoxResolution.setCurrentIndex(1)
+
+        # Start / Stop buttons
+        self.pushButtonStart = QtWidgets.QPushButton("Start")
+        self.pushButtonStop = QtWidgets.QPushButton("Stop")
+        self.pushButtonStop.setEnabled(False)
+
+        # Calibration controls
+        self.label_points = QtWidgets.QLabel("Points")
+        self.comboBoxPoints = QtWidgets.QComboBox()
+        self.comboBoxPoints.addItem("1", 1)
+        self.comboBoxPoints.addItem("3", 3)
+        self.comboBoxPoints.addItem("5", 5)
+        self.comboBoxPoints.addItem("9", 9)
+        self.comboBoxPoints.setCurrentIndex(1)
+
+        self.pushButtonStartCalibration = QtWidgets.QPushButton("Start Calibration")
+        self.pushButtonStartCalibration.setEnabled(False)
+        self.pushButtonCancelCalibration = QtWidgets.QPushButton("Stop Calibration")
+
+        # Left Pupil group
+        self.groupBox_left_pupil = QtWidgets.QGroupBox("Left Pupil")
+        left_pupil_layout = QtWidgets.QGridLayout(self.groupBox_left_pupil)
+        self.label_lp_x_title = QtWidgets.QLabel("X")
+        self.label_lp_y_title = QtWidgets.QLabel("Y")
+        self.labelLeftPupilCenterX = QtWidgets.QLabel("")
+        self.labelLeftPupilCenterX.setFrameShape(QtWidgets.QFrame.WinPanel)
+        self.labelLeftPupilCenterX.setFrameShadow(QtWidgets.QFrame.Sunken)
+        self.labelLeftPupilCenterY = QtWidgets.QLabel("")
+        self.labelLeftPupilCenterY.setFrameShape(QtWidgets.QFrame.WinPanel)
+        self.labelLeftPupilCenterY.setFrameShadow(QtWidgets.QFrame.Sunken)
+        left_pupil_layout.addWidget(self.label_lp_x_title, 0, 0)
+        left_pupil_layout.addWidget(self.labelLeftPupilCenterX, 0, 1)
+        left_pupil_layout.addWidget(self.label_lp_y_title, 1, 0)
+        left_pupil_layout.addWidget(self.labelLeftPupilCenterY, 1, 1)
+
+        # Right Pupil group
+        self.groupBox_right_pupil = QtWidgets.QGroupBox("Right Pupil")
+        right_pupil_layout = QtWidgets.QGridLayout(self.groupBox_right_pupil)
+        self.label_rp_x_title = QtWidgets.QLabel("X")
+        self.label_rp_y_title = QtWidgets.QLabel("Y")
+        self.labelRightPupilCenterX = QtWidgets.QLabel("")
+        self.labelRightPupilCenterX.setFrameShape(QtWidgets.QFrame.WinPanel)
+        self.labelRightPupilCenterX.setFrameShadow(QtWidgets.QFrame.Sunken)
+        self.labelRightPupilCenterY = QtWidgets.QLabel("")
+        self.labelRightPupilCenterY.setFrameShape(QtWidgets.QFrame.WinPanel)
+        self.labelRightPupilCenterY.setFrameShadow(QtWidgets.QFrame.Sunken)
+        right_pupil_layout.addWidget(self.label_rp_x_title, 0, 0)
+        right_pupil_layout.addWidget(self.labelRightPupilCenterX, 0, 1)
+        right_pupil_layout.addWidget(self.label_rp_y_title, 1, 0)
+        right_pupil_layout.addWidget(self.labelRightPupilCenterY, 1, 1)
+
+        # Recommend Gaze group
+        self.groupBox_gaze = QtWidgets.QGroupBox("Recommend Gaze")
+        gaze_layout = QtWidgets.QGridLayout(self.groupBox_gaze)
+        self.label_gaze_x_title = QtWidgets.QLabel("X")
+        self.label_gaze_y_title = QtWidgets.QLabel("Y")
+        self.labelGazeX = QtWidgets.QLabel("")
+        self.labelGazeX.setFrameShape(QtWidgets.QFrame.WinPanel)
+        self.labelGazeX.setFrameShadow(QtWidgets.QFrame.Sunken)
+        self.labelGazeY = QtWidgets.QLabel("")
+        self.labelGazeY.setFrameShape(QtWidgets.QFrame.WinPanel)
+        self.labelGazeY.setFrameShadow(QtWidgets.QFrame.Sunken)
+        gaze_layout.addWidget(self.label_gaze_x_title, 0, 0)
+        gaze_layout.addWidget(self.labelGazeX, 0, 1)
+        gaze_layout.addWidget(self.label_gaze_y_title, 1, 0)
+        gaze_layout.addWidget(self.labelGazeY, 1, 1)
+
+        # Metrics (rate, count, log)
         self.rate_label = QtWidgets.QLabel("Rate: -- Hz")
         self.count_label = QtWidgets.QLabel("Samples: 0")
         self.log_label = QtWidgets.QLabel("Log: --")
-        metrics_layout.addWidget(self.rate_label)
-        metrics_layout.addWidget(self.count_label)
-        metrics_layout.addWidget(self.log_label)
-        metrics_layout.addStretch()
 
-        content_layout = QtWidgets.QHBoxLayout()
-        content_layout.setSpacing(12)
-        root.addLayout(content_layout, stretch=1)
+        # === Main content area ===
+        # Scene image label (clickable, matching official sample)
+        self.labelSceneImage = SceneImageLabel()
+        self.labelSceneImage.connect_customized_slot(self._on_scene_image_area_clicked)
+        self.labelSceneImage.setFrameShape(QtWidgets.QFrame.WinPanel)
+        self.labelSceneImage.setFrameShadow(QtWidgets.QFrame.Sunken)
+        self.labelSceneImage.setText("scene image area")
+        self.labelSceneImage.setMinimumSize(640, 360)
 
-        left_panel = QtWidgets.QVBoxLayout()
-        left_panel.setSpacing(10)
-        content_layout.addLayout(left_panel, stretch=0)
+        # Eye images
+        self.labelLeftEyeImage = QtWidgets.QLabel("left eye image")
+        self.labelLeftEyeImage.setFrameShape(QtWidgets.QFrame.WinPanel)
+        self.labelLeftEyeImage.setFrameShadow(QtWidgets.QFrame.Sunken)
+        self.labelLeftEyeImage.setFixedSize(160, 120)
 
-        connection_group = QtWidgets.QGroupBox("Connection")
-        connection_layout = QtWidgets.QVBoxLayout(connection_group)
-        left_panel.addWidget(connection_group)
+        self.labelRightEyeImage = QtWidgets.QLabel("right eye image")
+        self.labelRightEyeImage.setFrameShape(QtWidgets.QFrame.WinPanel)
+        self.labelRightEyeImage.setFrameShadow(QtWidgets.QFrame.Sunken)
+        self.labelRightEyeImage.setFixedSize(160, 120)
 
-        self.environment_combo = QtWidgets.QComboBox()
-        self.environment_combo.addItem("Indoor", PY_7I_ENVIRONMENT.INDOOR.value)
-        self.environment_combo.addItem("Outdoor", PY_7I_ENVIRONMENT.OUTDOOR.value)
-        self.environment_combo.addItem("Darkness", PY_7I_ENVIRONMENT.DARKNESS.value)
-
-        self.resolution_combo = QtWidgets.QComboBox()
-        self.resolution_combo.addItem("1280 x 720", PY_7I_RESOLUTION.P1280_720.value)
-        self.resolution_combo.addItem("1280 x 960", PY_7I_RESOLUTION.P1280_960.value)
-        self.resolution_combo.addItem("800 x 600", PY_7I_RESOLUTION.P800_600.value)
-        self.resolution_combo.addItem("1920 x 1080", PY_7I_RESOLUTION.P1920_1080.value)
-
-        connection_layout.addWidget(QtWidgets.QLabel("Environment"))
-        connection_layout.addWidget(self.environment_combo)
-        connection_layout.addWidget(QtWidgets.QLabel("Resolution"))
-        connection_layout.addWidget(self.resolution_combo)
-
-        self.start_button = QtWidgets.QPushButton("Start")
-        self.stop_button = QtWidgets.QPushButton("Stop")
-        self.stop_button.setEnabled(False)
-        connection_layout.addWidget(self.start_button)
-        connection_layout.addWidget(self.stop_button)
-
-        calibration_group = QtWidgets.QGroupBox("Calibration")
-        calibration_layout = QtWidgets.QVBoxLayout(calibration_group)
-        left_panel.addWidget(calibration_group)
-
-        self.points_combo = QtWidgets.QComboBox()
-        self.points_combo.addItem("1 point", 1)
-        self.points_combo.addItem("3 points", 3)
-        self.points_combo.addItem("5 points", 5)
-        self.points_combo.addItem("9 points", 9)
-        calibration_layout.addWidget(QtWidgets.QLabel("Points"))
-        calibration_layout.addWidget(self.points_combo)
-
-        self.calibrate_button = QtWidgets.QPushButton("Start Calibration")
-        self.stop_calibration_button = QtWidgets.QPushButton("Stop Calibration")
-        self.calibrate_button.setEnabled(False)
-        self.stop_calibration_button.setEnabled(False)
-        calibration_layout.addWidget(self.calibrate_button)
-        calibration_layout.addWidget(self.stop_calibration_button)
-
-        self.calibration_hint = QtWidgets.QLabel("Look at each target point as it appears.\nCalibration runs automatically.")
-        self.calibration_hint.setWordWrap(True)
-        calibration_layout.addWidget(self.calibration_hint)
-
-        live_group = QtWidgets.QGroupBox("Live Values")
-        live_layout = QtWidgets.QGridLayout(live_group)
-        left_panel.addWidget(live_group)
-
-        self.gaze_value = QtWidgets.QLabel("--")
-        self.left_pupil_value = QtWidgets.QLabel("--")
-        self.right_pupil_value = QtWidgets.QLabel("--")
-        self.openness_value = QtWidgets.QLabel("--")
-        self.blink_value = QtWidgets.QLabel("--")
-
-        live_layout.addWidget(QtWidgets.QLabel("Gaze (x, y)"), 0, 0)
-        live_layout.addWidget(self.gaze_value, 0, 1)
-        live_layout.addWidget(QtWidgets.QLabel("Left pupil (x, y)"), 1, 0)
-        live_layout.addWidget(self.left_pupil_value, 1, 1)
-        live_layout.addWidget(QtWidgets.QLabel("Right pupil (x, y)"), 2, 0)
-        live_layout.addWidget(self.right_pupil_value, 2, 1)
-        live_layout.addWidget(QtWidgets.QLabel("Openness (L/R)"), 3, 0)
-        live_layout.addWidget(self.openness_value, 3, 1)
-        live_layout.addWidget(QtWidgets.QLabel("Blink (L/R)"), 4, 0)
-        live_layout.addWidget(self.blink_value, 4, 1)
-
-        left_panel.addStretch(1)
-
-        right_panel = QtWidgets.QVBoxLayout()
-        right_panel.setSpacing(10)
-        content_layout.addLayout(right_panel, stretch=1)
-
+        # pyqtgraph plots (secondary, below scene image)
+        pg.setConfigOptions(antialias=False, useOpenGL=False)
         self.gaze_plot = pg.PlotWidget(title="Gaze X / Y")
-        self.gaze_plot.showGrid(x=True, y=True, alpha=self.theme["grid_alpha"])
+        self.gaze_plot.showGrid(x=True, y=True, alpha=0.2)
         self.gaze_plot.setLabel("bottom", "Time (s)")
         self.gaze_plot.setLabel("left", "Pixels")
-        self.gaze_x_curve = self.gaze_plot.plot(pen=pg.mkPen(self.theme["accent"], width=2), name="Gaze X")
+        self.gaze_x_curve = self.gaze_plot.plot(pen=pg.mkPen("#4ED1A6", width=2), name="Gaze X")
         self.gaze_y_curve = self.gaze_plot.plot(pen=pg.mkPen("#FF7F50", width=2), name="Gaze Y")
 
         self.pupil_plot = pg.PlotWidget(title="Pupil Diameter (mm)")
-        self.pupil_plot.showGrid(x=True, y=True, alpha=self.theme["grid_alpha"])
+        self.pupil_plot.showGrid(x=True, y=True, alpha=0.2)
         self.pupil_plot.setLabel("bottom", "Time (s)")
         self.pupil_plot.setLabel("left", "Diameter (mm)")
         self.left_pupil_curve = self.pupil_plot.plot(pen=pg.mkPen("#9AD1FF", width=2), name="Left")
         self.right_pupil_curve = self.pupil_plot.plot(pen=pg.mkPen("#FFD166", width=2), name="Right")
 
-        right_panel.addWidget(self.gaze_plot, stretch=1)
-        right_panel.addWidget(self.pupil_plot, stretch=1)
+        # === Layout assembly ===
+        # Use a horizontal layout: left sidebar | right content
+        main_layout = QtWidgets.QHBoxLayout(central)
+        main_layout.setContentsMargins(4, 4, 4, 4)
+        main_layout.setSpacing(4)
 
-        canvas_group = QtWidgets.QGroupBox("Calibration Canvas / Gaze Overlay")
-        canvas_layout = QtWidgets.QVBoxLayout(canvas_group)
-        self.canvas = CalibrationCanvas()
-        self.canvas.set_theme(self.theme)
-        canvas_layout.addWidget(self.canvas)
-        right_panel.addWidget(canvas_group, stretch=1)
+        # Left sidebar
+        sidebar = QtWidgets.QVBoxLayout()
+        sidebar.setSpacing(4)
+        sidebar.addWidget(self.groupBox_env)
+        sidebar.addWidget(self.groupBox_res)
+        sidebar.addWidget(self.pushButtonStart)
+        sidebar.addWidget(self.pushButtonStop)
 
-        self.start_button.clicked.connect(self._on_start)
-        self.stop_button.clicked.connect(self._on_stop)
-        self.calibrate_button.clicked.connect(self._on_start_calibration)
-        self.stop_calibration_button.clicked.connect(self._on_stop_calibration)
+        points_row = QtWidgets.QHBoxLayout()
+        points_row.addWidget(self.label_points)
+        points_row.addWidget(self.comboBoxPoints)
+        sidebar.addLayout(points_row)
+
+        sidebar.addWidget(self.pushButtonStartCalibration)
+        sidebar.addWidget(self.pushButtonCancelCalibration)
+        sidebar.addWidget(self.groupBox_left_pupil)
+        sidebar.addWidget(self.groupBox_right_pupil)
+        sidebar.addWidget(self.groupBox_gaze)
+
+        sidebar.addWidget(self.rate_label)
+        sidebar.addWidget(self.count_label)
+        sidebar.addWidget(self.log_label)
+
+        sidebar.addStretch()
+        main_layout.addLayout(sidebar)
+
+        # Right content: scene image + eye images on top, plots on bottom
+        right_layout = QtWidgets.QVBoxLayout()
+        right_layout.setSpacing(4)
+
+        # Top row: scene image with eye images below-left
+        scene_area = QtWidgets.QVBoxLayout()
+        scene_area.setSpacing(2)
+        scene_area.addWidget(self.labelSceneImage, stretch=1)
+
+        eye_row = QtWidgets.QHBoxLayout()
+        eye_row.setSpacing(2)
+        eye_row.addWidget(self.labelLeftEyeImage)
+        eye_row.addWidget(self.labelRightEyeImage)
+        eye_row.addStretch()
+        scene_area.addLayout(eye_row)
+
+        right_layout.addLayout(scene_area, stretch=3)
+
+        # Bottom: plots side by side
+        plots_row = QtWidgets.QHBoxLayout()
+        plots_row.setSpacing(4)
+        plots_row.addWidget(self.gaze_plot)
+        plots_row.addWidget(self.pupil_plot)
+        right_layout.addLayout(plots_row, stretch=1)
+
+        main_layout.addLayout(right_layout, stretch=1)
+
+    def _connect_signals(self):
+        # Button signals
+        self.pushButtonStart.clicked.connect(self._on_start)
+        self.pushButtonStop.clicked.connect(self._on_stop)
+        self.pushButtonStartCalibration.clicked.connect(self._on_start_calibration)
+        self.pushButtonCancelCalibration.clicked.connect(self._on_stop_calibration)
+
+        # SDK callback signals (matching official sample pattern)
+        self.set_sdk_running_signal.connect(self._on_set_sdk_running)
+        self.set_pupil_center_signal.connect(self._display_pupil_data)
+        self.set_gaze_signal.connect(self._display_gaze_data)
+        self.set_scene_image_signal.connect(self._display_scene_image)
+        self.set_left_eye_image_signal.connect(self._display_left_eye_image)
+        self.set_right_eye_image_signal.connect(self._display_right_eye_image)
+        self.set_calibration_finish_signal.connect(self._on_set_calibration_finish)
+
+    # ---- Signal slots (matching official sample) ----
+
+    def _display_scene_image(self, image):
+        """Draw gaze overlay on scene image, then display (matching official sample)."""
+        painter = QPainter(image)
+        painter.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        color = QColor()
+        color.setGreen(255)
+        painter.setBrush(QBrush(color))
+        diameter = 30
+        rect = QRectF(self.cur_gaze_x - diameter / 2, self.cur_gaze_y - diameter / 2, diameter, diameter)
+        painter.drawEllipse(rect)
+        self.labelSceneImage.setPixmap(image)
+
+    def _display_left_eye_image(self, image):
+        self.labelLeftEyeImage.setPixmap(image)
+
+    def _display_right_eye_image(self, image):
+        self.labelRightEyeImage.setPixmap(image)
+
+    def _display_pupil_data(self, left_x, left_y, right_x, right_y):
+        self.labelLeftPupilCenterX.setText(str(left_x))
+        self.labelLeftPupilCenterY.setText(str(left_y))
+        self.labelRightPupilCenterX.setText(str(right_x))
+        self.labelRightPupilCenterY.setText(str(right_y))
+
+    def _display_gaze_data(self, x, y):
+        self.labelGazeX.setText(str(x))
+        self.labelGazeY.setText(str(y))
+        # Convert from center-origin to top-left-origin for drawing (matching official sample)
+        self.cur_gaze_x = (x + self.scene_width / 2)
+        self.cur_gaze_y = (y + self.scene_height / 2)
+
+    def _on_set_sdk_running(self, enabled):
+        self.sdk_running = enabled
+        self.pushButtonStart.setEnabled(not enabled)
+        self.pushButtonStop.setEnabled(enabled)
+        self.pushButtonStartCalibration.setEnabled(enabled)
+        if not enabled:
+            self.labelSceneImage.setPixmap(QPixmap())
+            self.labelLeftEyeImage.setPixmap(QPixmap())
+            self.labelRightEyeImage.setPixmap(QPixmap())
+
+    def _on_set_calibration_finish(self, eye, index, error):
+        """Handle calibration point finish (matching official sample logic)."""
+        self.finish_points[index - 1][eye] = error
+        n = self.current_points
+        if n == 1:
+            if 1 != self.finish_points[0][0] and 1 != self.finish_points[0][1]:
+                self._on_stop_calibration()
+        elif n == 3:
+            if (1 != self.finish_points[0][0] and 1 != self.finish_points[0][1] and
+                    1 != self.finish_points[1][0] and 1 != self.finish_points[1][1] and
+                    1 != self.finish_points[2][0] and 1 != self.finish_points[2][1]):
+                self._on_stop_calibration()
+        elif n == 5:
+            if all(1 != self.finish_points[i][e]
+                   for i in range(5) for e in range(2)):
+                self._on_stop_calibration()
+        elif n == 9:
+            if all(1 != self.finish_points[i][e]
+                   for i in range(9) for e in range(2)):
+                self._on_stop_calibration()
+
+    # ---- Scene image click (calibration point selection) ----
+
+    def _on_scene_image_area_clicked(self, x, y):
+        """Convert click position to SDK center-origin coordinates (matching official sample)."""
+        point_x = float(x) - float(self.scene_width / 2)
+        point_y = float(y) - float(self.scene_height / 2)
+        print("point:%f %f" % (point_x, point_y))
+        self.sdk.set_current_point(point_x, point_y)
 
     # ---- SDK start / stop ----
 
     def _on_start(self):
         pwd = self._read_pwd()
         if not pwd:
-            QtWidgets.QMessageBox.warning(self, "Warning", "Password not found in config.ini")
+            QtWidgets.QMessageBox.warning(self, "warning", "Please check that 'pwd' is correct in config.ini file!")
             return
 
         ret = self.sdk.connect_softdog(pwd)
         if ret != 0:
-            QtWidgets.QMessageBox.warning(self, "Warning", "Softdog connection failed")
+            QtWidgets.QMessageBox.warning(self, "warning", "Please check that 'pwd' is correct in config.ini file!")
             return
 
-        environment = self.environment_combo.currentData()
-        resolution = self.resolution_combo.currentData()
-        if resolution == PY_7I_RESOLUTION.P1280_960.value:
+        environment = self.comboBoxEnvironment.currentData()
+        resolution = self.comboBoxResolution.currentData()
+        if PY_7I_RESOLUTION.P1280_960.value == resolution:
             self.scene_width, self.scene_height = 1280, 960
-        elif resolution == PY_7I_RESOLUTION.P1280_720.value:
+        elif PY_7I_RESOLUTION.P1280_720.value == resolution:
             self.scene_width, self.scene_height = 1280, 720
-        elif resolution == PY_7I_RESOLUTION.P800_600.value:
+        elif PY_7I_RESOLUTION.P800_600.value == resolution:
             self.scene_width, self.scene_height = 800, 600
-        elif resolution == PY_7I_RESOLUTION.P1920_1080.value:
+        elif PY_7I_RESOLUTION.P1920_1080.value == resolution:
             self.scene_width, self.scene_height = 1920, 1080
 
         ret = self.sdk.start(environment, resolution, self.scene_width, self.scene_height)
-        if ret != 0:
-            QtWidgets.QMessageBox.warning(self, "Warning", "SDK start failed")
-            return
+        if ret == 0:
+            self.sdk_running = True
+            self.pushButtonStop.setEnabled(True)
+            self.pushButtonStart.setEnabled(False)
+            self.pushButtonStartCalibration.setEnabled(True)
 
-        log_dir = os.path.join(os.path.dirname(os.getcwd()), "log")
-        os.makedirs(log_dir, exist_ok=True)
-        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = os.path.join(log_dir, f"eye_tracker_{timestamp_str}.csv")
-        self.csv_writer = CSVWriterThread(output_file)
-        self.csv_writer.start()
-        self.log_label.setText(f"Log: {output_file}")
+            # Start CSV logging
+            log_dir = os.path.join(os.path.dirname(os.getcwd()), "log")
+            os.makedirs(log_dir, exist_ok=True)
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file = os.path.join(log_dir, f"eye_tracker_{timestamp_str}.csv")
+            self.csv_writer = CSVWriterThread(output_file)
+            self.csv_writer.start()
+            self.log_label.setText(f"Log: {output_file}")
 
-        self.sdk_running = True
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self.calibrate_button.setEnabled(True)
-        self.stop_calibration_button.setEnabled(False)
-        self.timer.start()
+            self.timer.start()
+        else:
+            self.sdk_running = False
+            self.pushButtonStartCalibration.setEnabled(False)
 
     def _on_stop(self):
-        if self.calib_active:
-            self._abort_calibration()
-        if self.sdk_running:
-            self.sdk.stop()
+        self.sdk.stop()
+        self.pushButtonStop.setEnabled(False)
+        self.pushButtonStart.setEnabled(True)
+        self.pushButtonStartCalibration.setEnabled(False)
+        self.labelSceneImage.setPixmap(QPixmap())
+        self.labelLeftEyeImage.setPixmap(QPixmap())
+        self.labelRightEyeImage.setPixmap(QPixmap())
         self.sdk_running = False
         self.timer.stop()
         if self.csv_writer:
             self.csv_writer.stop()
             self.csv_writer = None
 
-        self.start_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
-        self.calibrate_button.setEnabled(False)
-        self.stop_calibration_button.setEnabled(False)
-
-    # ---- Calibration ----
-
-    def _sdk_to_canvas(self, sdk_x, sdk_y):
-        """Convert SDK center-origin coords to canvas pixel coords."""
-        canvas_w = max(1, self.canvas.width())
-        canvas_h = max(1, self.canvas.height())
-        # SDK: origin center, Y up. Canvas: origin top-left, Y down.
-        cx = (sdk_x + self.scene_width / 2) / self.scene_width * canvas_w
-        cy = (self.scene_height / 2 - sdk_y) / self.scene_height * canvas_h
-        return cx, cy
+    # ---- Calibration (click-on-scene pattern, matching official sample) ----
 
     def _on_start_calibration(self):
-        if not self.sdk_running:
-            return
-
-        self.calib_n_points = self.points_combo.currentData()
-        self.calib_points_sdk = get_calibration_points(
-            self.calib_n_points, self.scene_width, self.scene_height
-        )
-        # Convert to canvas coords
-        self.calib_points_canvas = [
-            self._sdk_to_canvas(sx, sy) for sx, sy in self.calib_points_sdk
-        ]
-
-        self.canvas.setup_points(self.calib_points_canvas)
-        self.calib_current_idx = 0
-        self.calib_active = True
-        self.calib_finish_count = 0
-
-        self.calibrate_button.setEnabled(False)
-        self.stop_calibration_button.setEnabled(True)
-        self.calibration_hint.setText("Calibration starting...\nLook at each target point.")
-
-        # Start the SDK calibration thread (it waits for set_current_point events)
-        self.sdk.start_calibration(self.calib_n_points)
-
-        # Begin showing the first point after a short delay
-        self.calib_timer = QtCore.QTimer(self)
-        self.calib_timer.setSingleShot(True)
-        self.calib_timer.timeout.connect(self._calib_show_current_point)
-        self.calib_timer.start(500)
-
-    def _calib_show_current_point(self):
-        """Show the current calibration target and start countdown."""
-        if not self.calib_active:
-            return
-        if self.calib_current_idx >= self.calib_n_points:
-            # All points done - wait for SDK thread to finish computing
-            self.canvas.set_status("Computing calibration...")
-            self.canvas.set_countdown(-1)
-            self.calibration_hint.setText("Processing calibration data...")
-            return
-
-        idx = self.calib_current_idx
-        self.canvas.show_point(idx)
-        self.canvas.set_status(f"Point {idx + 1}/{self.calib_n_points} - Get ready!")
-        self.canvas.set_countdown(-1)
-        self.calibration_hint.setText(
-            f"Point {idx + 1}/{self.calib_n_points}\nLook at the target..."
-        )
-
-        # After CALIB_POINT_SHOW_DELAY, start collecting
-        self.calib_timer = QtCore.QTimer(self)
-        self.calib_timer.setSingleShot(True)
-        self.calib_timer.timeout.connect(self._calib_start_collecting)
-        self.calib_timer.start(int(CALIB_POINT_SHOW_DELAY * 1000))
-
-    def _calib_start_collecting(self):
-        """Send the current point to the SDK and start countdown."""
-        if not self.calib_active:
-            return
-        idx = self.calib_current_idx
-        sdk_x, sdk_y = self.calib_points_sdk[idx]
-
-        self.calib_finish_count = 0
-        self.calib_point_done = False
-        self.sdk.set_current_point(sdk_x, sdk_y)
-
-        self.canvas.set_status(f"Point {idx + 1}/{self.calib_n_points} - Collecting...")
-        self.calibration_hint.setText(
-            f"Point {idx + 1}/{self.calib_n_points}\nKeep looking at the target!"
-        )
-
-        # Start countdown
-        self._calib_countdown_remaining = int(CALIB_POINT_COLLECT_TIME)
-        self.canvas.set_countdown(self._calib_countdown_remaining)
-        self.calib_timer = QtCore.QTimer(self)
-        self.calib_timer.timeout.connect(self._calib_countdown_tick)
-        self.calib_timer.start(1000)
-
-    def _calib_countdown_tick(self):
-        """Tick the countdown. When it reaches 0, advance (timeout fallback)."""
-        self._calib_countdown_remaining -= 1
-        if self._calib_countdown_remaining <= 0:
-            self.calib_timer.stop()
-            self.canvas.set_countdown(-1)
-            if not self.calib_point_done:
-                self._calib_advance_to_next()
-        else:
-            self.canvas.set_countdown(self._calib_countdown_remaining)
-
-    def _calib_advance_to_next(self):
-        """Move to the next calibration point."""
-        # Mark current as collected
-        self.canvas.mark_collected(self.calib_current_idx)
-        self.calib_current_idx += 1
-
-        if self.calib_current_idx >= self.calib_n_points:
-            # All points sent - wait for SDK thread to finish
-            self.canvas.set_status("All points collected. Computing...")
-            self.calibration_hint.setText("All points done.\nWaiting for computation...")
-        else:
-            # Brief transition then show next point
-            self.canvas.set_status("")
-            self.calib_timer = QtCore.QTimer(self)
-            self.calib_timer.setSingleShot(True)
-            self.calib_timer.timeout.connect(self._calib_show_current_point)
-            self.calib_timer.start(int(CALIB_POINT_TRANSITION * 1000))
-
-    def _on_calibration_finish(self, eye, index, error):
-        """Called when SDK finishes collecting a calibration point for one eye."""
-        print(f"calibration finish: eye={eye} index={index} error={error}")
-        if not self.calib_active or self.calib_point_done:
-            return
-        self.calib_finish_count += 1
-
-        # When both eyes finish, advance immediately and cancel timeout
-        if self.calib_finish_count >= self.calib_expected_finish:
-            self.calib_point_done = True
-            if self.calib_timer:
-                self.calib_timer.stop()
-            self.canvas.set_countdown(-1)
-            if self.calib_current_idx < self.calib_n_points:
-                self._calib_advance_to_next()
+        self.current_points = self.comboBoxPoints.currentData()
+        self._init_finish_points()
+        self.calibration_is_running = True
+        self.sdk.start_calibration(self.current_points)
+        self.pushButtonStartCalibration.setEnabled(False)
 
     def _on_stop_calibration(self):
-        """User clicked stop calibration."""
-        self._abort_calibration()
-
-    def _abort_calibration(self):
-        """Cancel any in-progress calibration."""
-        self.calib_active = False
-        if self.calib_timer:
-            self.calib_timer.stop()
-            self.calib_timer = None
         self.sdk.stop_calibration()
-        self.canvas.clear_calibration()
-        self.calibration_hint.setText("Calibration cancelled.")
-        self.calibrate_button.setEnabled(self.sdk_running)
-        self.stop_calibration_button.setEnabled(False)
+        self.calibration_is_running = False
+        self.pushButtonStartCalibration.setEnabled(self.sdk_running)
 
-    # ---- Timer / data ----
+    def _init_finish_points(self):
+        for i in range(len(self.finish_points)):
+            self.finish_points[i][0] = 1
+            self.finish_points[i][1] = 1
+
+    # ---- Timer / data for plots and CSV ----
 
     def _on_timer(self):
         now = time.perf_counter()
@@ -794,8 +620,6 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
             if self.csv_writer:
                 self.csv_writer.push(sample)
 
-            self._update_canvas_gaze(sample)
-
         if drained == 0:
             return
 
@@ -807,26 +631,16 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
             self._update_metrics()
             self.last_metric_update = now
 
-    def _update_canvas_gaze(self, sample):
-        canvas_w = max(1, self.canvas.width())
-        canvas_h = max(1, self.canvas.height())
-        # SDK: origin center, Y up. Canvas: origin top-left, Y down.
-        x = (sample["gaze_x"] + self.scene_width / 2) / self.scene_width * canvas_w
-        y = (self.scene_height / 2 - sample["gaze_y"]) / self.scene_height * canvas_h
-        self.canvas.set_gaze(x, y)
-
     def _update_plots(self):
         gaze_x = self.gaze_x_series.ordered()
         gaze_y = self.gaze_y_series.ordered()
         x_axis = self.gaze_x_series.x_axis(len(gaze_x))
-
         self.gaze_x_curve.setData(x_axis, gaze_x)
         self.gaze_y_curve.setData(x_axis, gaze_y)
 
         left_pupil = self.left_pupil_series.ordered()
         right_pupil = self.right_pupil_series.ordered()
         x_axis_pupil = self.left_pupil_series.x_axis(len(left_pupil))
-
         self.left_pupil_curve.setData(x_axis_pupil, left_pupil)
         self.right_pupil_curve.setData(x_axis_pupil, right_pupil)
 
@@ -834,22 +648,6 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         rate = self.rate_tracker.current_rate()
         self.rate_label.setText(f"Rate: {rate:.1f} Hz")
         self.count_label.setText(f"Samples: {self.packet_count}")
-        if self.latest_sample:
-            self.gaze_value.setText(
-                f"{self.latest_sample['gaze_x']:.1f}, {self.latest_sample['gaze_y']:.1f}"
-            )
-            self.left_pupil_value.setText(
-                f"{self.latest_sample['left_pupil_x']:.1f}, {self.latest_sample['left_pupil_y']:.1f}"
-            )
-            self.right_pupil_value.setText(
-                f"{self.latest_sample['right_pupil_x']:.1f}, {self.latest_sample['right_pupil_y']:.1f}"
-            )
-            self.openness_value.setText(
-                f"{self.latest_sample['left_openness']:.2f}, {self.latest_sample['right_openness']:.2f}"
-            )
-            self.blink_value.setText(
-                f"{self.latest_sample['left_blink']}, {self.latest_sample['right_blink']}"
-            )
 
     def _read_pwd(self):
         config_path = os.path.join(self.sdk_config_path, "config.ini")
@@ -859,12 +657,23 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         return pwd.encode("utf-8")
 
     def closeEvent(self, event):
-        if self.calib_active:
-            self._abort_calibration()
-        if self.sdk_running:
-            self._on_stop()
-            time.sleep(1)
-        event.accept()
+        reply = QtWidgets.QMessageBox.question(
+            self, 'warning', "Are you sure exit?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        if reply == QtWidgets.QMessageBox.Yes:
+            if self.calibration_is_running:
+                self.sdk.stop_calibration()
+            if self.sdk_running:
+                self.sdk.stop()
+                time.sleep(3)
+            if self.csv_writer:
+                self.csv_writer.stop()
+                self.csv_writer = None
+            event.accept()
+            self.close()
+        else:
+            event.ignore()
 
 
 def parse_args():
@@ -880,7 +689,7 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     window = EyeTrackerMonitorWindow(args.sdk_root, args.sample_rate, args.window_seconds)
     window.show()
-    sys.exit(app.exec())
+    sys.exit(app.exec_())
 
 
 if __name__ == "__main__":

@@ -4,6 +4,8 @@ import threading
 import time
 import struct
 from threading import *
+from PyQt5 import QtCore
+from PyQt5.QtGui import QImage, QPixmap
 from sdk_types import *
 import ctypes
 
@@ -34,9 +36,6 @@ class wrapper:
     cur_point_y = 0.0
 
     scene_img_size_max = 1920 * 1080 * 3 
-    #scene_img_buf = bytes(scene_img_size_max)
-
-    scene_img_buf = py_7i_bytes() 
 
     def set_current_point(self, x, y):
         self.cur_point_x = float(x)
@@ -57,7 +56,19 @@ class wrapper:
     @staticmethod
     def image_callback(eye, image, size, width, height, timestamp, context):
         self = context
-        pass
+        if 13 == eye:  # scene images
+            ptr = ctypes.cast(image, ctypes.c_void_p)
+            self.h256_dll_handle._7i_h265_decode(size, ptr, self.scene_img_buf.data, self.scene_img_size_max)
+            img = QPixmap.fromImage(QImage(self.scene_img_buf.data, width, height, QImage.Format_BGR888))  # BGR Image
+            wrapper.ui_handle.set_scene_image_signal.emit(img)
+        else:
+            if PY_7I_EYE_TYPE.L_EYE.value == eye:
+                img = QPixmap.fromImage(QImage(image, width, height, QImage.Format_Indexed8).scaled(160, 120, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation))  # Gray Image
+                wrapper.ui_handle.set_left_eye_image_signal.emit(img)
+            elif PY_7I_EYE_TYPE.R_EYE.value == eye:
+                img = QPixmap.fromImage(QImage(image, width, height, QImage.Format_Indexed8).scaled(160, 120, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation))  # Gray Image
+                wrapper.ui_handle.set_right_eye_image_signal.emit(img)
+
 
 
     @staticmethod
@@ -65,6 +76,14 @@ class wrapper:
         self = context
         obj = eyes.__getitem__(0)
 
+        # Emit signals for UI display (matching official sample pattern)
+        if wrapper.ui_handle:
+            wrapper.ui_handle.set_pupil_center_signal.emit(
+                obj.left_pupil.pupil_center.x, obj.left_pupil.pupil_center.y,
+                obj.right_pupil.pupil_center.x, obj.right_pupil.pupil_center.y)
+            wrapper.ui_handle.set_gaze_signal.emit(obj.recom_gaze.gaze_point.x, obj.recom_gaze.gaze_point.y)
+
+        # Also push to data_queue for CSV logging and plots
         sample = {
             "pc_timestamp": time.time(),
             "perf_timestamp": time.perf_counter(),
@@ -122,6 +141,8 @@ class wrapper:
         self.py_right_point_process_cb = func_point_process_callback_t(wrapper.right_point_process_callback)
         self.py_right_point_finish_cb = func_point_finish_callback_t(wrapper.right_point_finish_callback)
         self.data_queue = queue.Queue()
+        self.scene_img_buf = py_7i_bytes()
+
 
     def load_library(self, path):
         if isinstance(path, bytes):
