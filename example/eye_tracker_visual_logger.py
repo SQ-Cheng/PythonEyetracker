@@ -26,6 +26,53 @@ from sdk_wrapper import wrapper
 import pyqtgraph as pg
 
 
+# ===================== Theme =====================
+
+THEME_DARK = {
+    'bg': '#12161C',
+    'fg': '#EAF0F7',
+    'grid_alpha': 0.2,
+    'label_color': '#EAF0F7',
+    'group_border': '#3A3F4B',
+    'group_title': '#EAF0F7',
+    'value_bg': '#1E2330',
+    'value_fg': '#4ED1A6',
+    'btn_bg': '#2A3040',
+    'btn_hover': '#3A4050',
+    'btn_text': '#EAF0F7',
+    'btn_disabled_bg': '#1A1F2A',
+    'btn_disabled_text': '#5A6070',
+    'separator': '#3A3F4B',
+}
+
+THEME_LIGHT = {
+    'bg': '#FFFFFF',
+    'fg': '#1A1A2E',
+    'grid_alpha': 0.3,
+    'label_color': '#1A1A2E',
+    'group_border': '#D0D5DD',
+    'group_title': '#1A1A2E',
+    'value_bg': '#F5F7FA',
+    'value_fg': '#0D7C66',
+    'btn_bg': '#E8ECF0',
+    'btn_hover': '#D0D5DD',
+    'btn_text': '#1A1A2E',
+    'btn_disabled_bg': '#F0F2F5',
+    'btn_disabled_text': '#A0A8B4',
+    'separator': '#D0D5DD',
+}
+
+
+def detect_dark_theme():
+    """Detect if the system is using a dark theme by checking palette luminance."""
+    palette = QtWidgets.QApplication.instance().palette()
+    window_color = palette.color(QtGui.QPalette.Window)
+    luminance = (0.299 * window_color.redF()
+                 + 0.587 * window_color.greenF()
+                 + 0.114 * window_color.blueF())
+    return luminance < 0.5
+
+
 DISPLAY_WINDOW_SECONDS = 10.0
 PLOT_UPDATE_INTERVAL_MS = 33
 METRIC_UPDATE_INTERVAL_MS = 250
@@ -235,199 +282,359 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         self.csv_writer = None
 
     def _build_ui(self):
+        # Theme
+        self.theme = THEME_DARK if detect_dark_theme() else THEME_LIGHT
+        t = self.theme
+
         self.setWindowTitle("Eye Tracker Monitor")
-        self.resize(1450, 734)
+        self.resize(1500, 900)
 
         central = QtWidgets.QWidget(self)
         self.setCentralWidget(central)
 
-        # === Left sidebar (narrow, matching official sample layout) ===
-        # Environment group
+        # ---- Stylesheet helpers ----
+        group_ss = (
+            f"QGroupBox {{"
+            f"  border: 1px solid {t['group_border']};"
+            f"  border-radius: 6px;"
+            f"  margin-top: 10px;"
+            f"  padding-top: 14px;"
+            f"  font-weight: bold;"
+            f"  color: {t['group_title']};"
+            f"}}"
+            f"QGroupBox::title {{"
+            f"  subcontrol-origin: margin;"
+            f"  left: 10px;"
+            f"  padding: 0 4px;"
+            f"}}"
+        )
+        value_ss = (
+            f"QLabel {{"
+            f"  background: {t['value_bg']};"
+            f"  color: {t['value_fg']};"
+            f"  border: 1px solid {t['group_border']};"
+            f"  border-radius: 4px;"
+            f"  padding: 2px 6px;"
+            f"  font-family: 'Consolas', 'Monaco', monospace;"
+            f"  font-size: 12px;"
+            f"  min-width: 70px;"
+            f"}}"
+        )
+        btn_ss = (
+            f"QPushButton {{"
+            f"  background: {t['btn_bg']};"
+            f"  color: {t['btn_text']};"
+            f"  border: 1px solid {t['group_border']};"
+            f"  border-radius: 5px;"
+            f"  padding: 6px 12px;"
+            f"  font-size: 13px;"
+            f"}}"
+            f"QPushButton:hover {{ background: {t['btn_hover']}; }}"
+            f"QPushButton:pressed {{ background: {t['group_border']}; }}"
+            f"QPushButton:disabled {{"
+            f"  background: {t['btn_disabled_bg']};"
+            f"  color: {t['btn_disabled_text']};"
+            f"}}"
+        )
+        combo_ss = (
+            f"QComboBox {{"
+            f"  background: {t['value_bg']};"
+            f"  color: {t['fg']};"
+            f"  border: 1px solid {t['group_border']};"
+            f"  border-radius: 4px;"
+            f"  padding: 3px 8px;"
+            f"  font-size: 12px;"
+            f"}}"
+            f"QComboBox::drop-down {{ border: none; }}"
+            f"QComboBox QAbstractItemView {{"
+            f"  background: {t['value_bg']};"
+            f"  color: {t['fg']};"
+            f"  selection-background-color: {t['btn_hover']};"
+            f"}}"
+        )
+        metric_ss = f"font-size: 13px; color: {t['label_color']};"
+        separator_ss = (
+            f"QFrame {{ background: {t['separator']}; max-height: 1px; }}"
+        )
+
+        # ---- Root layout ----
+        root = QtWidgets.QVBoxLayout(central)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        # ===== Top metrics bar =====
+        metrics_bar = QtWidgets.QHBoxLayout()
+        metrics_bar.setSpacing(24)
+        root.addLayout(metrics_bar)
+
+        self.rate_label = QtWidgets.QLabel("Rate: -- Hz")
+        self.count_label = QtWidgets.QLabel("Samples: 0")
+        self.log_label = QtWidgets.QLabel("Log: --")
+        for lbl in (self.rate_label, self.count_label, self.log_label):
+            lbl.setStyleSheet(metric_ss)
+            metrics_bar.addWidget(lbl)
+        metrics_bar.addStretch()
+
+        # ===== Main body: sidebar | content =====
+        body = QtWidgets.QHBoxLayout()
+        body.setSpacing(10)
+        root.addLayout(body, stretch=1)
+
+        # ---------- Left sidebar ----------
+        sidebar = QtWidgets.QVBoxLayout()
+        sidebar.setSpacing(6)
+        sidebar.setContentsMargins(0, 0, 0, 0)
+
+        # -- Device section --
         self.groupBox_env = QtWidgets.QGroupBox("Environment")
-        self.groupBox_env.setGeometry(3, -1, 120, 41)
-        self.comboBoxEnvironment = QtWidgets.QComboBox(self.groupBox_env)
-        self.comboBoxEnvironment.setGeometry(10, 13, 100, 22)
+        self.groupBox_env.setStyleSheet(group_ss)
+        env_layout = QtWidgets.QVBoxLayout(self.groupBox_env)
+        env_layout.setContentsMargins(8, 4, 8, 6)
+        env_layout.setSpacing(4)
+        self.comboBoxEnvironment = QtWidgets.QComboBox()
+        self.comboBoxEnvironment.setStyleSheet(combo_ss)
         self.comboBoxEnvironment.addItem("indoor", 301)
         self.comboBoxEnvironment.addItem("outdoor", 302)
         self.comboBoxEnvironment.addItem("darkness", 303)
         self.comboBoxEnvironment.setCurrentIndex(0)
+        env_layout.addWidget(self.comboBoxEnvironment)
 
-        # Resolution group
         self.groupBox_res = QtWidgets.QGroupBox("Resolution")
-        self.groupBox_res.setGeometry(3, 40, 121, 41)
-        self.comboBoxResolution = QtWidgets.QComboBox(self.groupBox_res)
-        self.comboBoxResolution.setGeometry(10, 12, 100, 22)
+        self.groupBox_res.setStyleSheet(group_ss)
+        res_layout = QtWidgets.QVBoxLayout(self.groupBox_res)
+        res_layout.setContentsMargins(8, 4, 8, 6)
+        res_layout.setSpacing(4)
+        self.comboBoxResolution = QtWidgets.QComboBox()
+        self.comboBoxResolution.setStyleSheet(combo_ss)
         self.comboBoxResolution.addItem("1280 * 960", 201)
         self.comboBoxResolution.addItem("1280 * 720", 202)
-        self.comboBoxResolution.addItem(" 800 * 600", 203)
+        self.comboBoxResolution.addItem("800 * 600", 203)
         self.comboBoxResolution.addItem("1920 * 1080", 204)
         self.comboBoxResolution.setCurrentIndex(1)
+        res_layout.addWidget(self.comboBoxResolution)
 
-        # Start / Stop buttons
-        self.pushButtonStart = QtWidgets.QPushButton("Start")
-        self.pushButtonStop = QtWidgets.QPushButton("Stop")
+        sidebar.addWidget(self.groupBox_env)
+        sidebar.addWidget(self.groupBox_res)
+
+        # -- Control buttons --
+        self.pushButtonStart = QtWidgets.QPushButton("▶  Start")
+        self.pushButtonStart.setStyleSheet(btn_ss)
+        self.pushButtonStop = QtWidgets.QPushButton("■  Stop")
+        self.pushButtonStop.setStyleSheet(btn_ss)
         self.pushButtonStop.setEnabled(False)
+        sidebar.addWidget(self.pushButtonStart)
+        sidebar.addWidget(self.pushButtonStop)
 
-        # Calibration controls
+        # Separator
+        sep1 = QtWidgets.QFrame()
+        sep1.setFrameShape(QtWidgets.QFrame.HLine)
+        sep1.setStyleSheet(separator_ss)
+        sidebar.addWidget(sep1)
+
+        # -- Calibration section --
+        cal_group = QtWidgets.QGroupBox("Calibration")
+        cal_group.setStyleSheet(group_ss)
+        cal_layout = QtWidgets.QVBoxLayout(cal_group)
+        cal_layout.setContentsMargins(8, 4, 8, 6)
+        cal_layout.setSpacing(4)
+
+        points_row = QtWidgets.QHBoxLayout()
+        points_row.setSpacing(6)
         self.label_points = QtWidgets.QLabel("Points")
+        self.label_points.setStyleSheet(f"font-size: 12px; color: {t['label_color']};")
         self.comboBoxPoints = QtWidgets.QComboBox()
+        self.comboBoxPoints.setStyleSheet(combo_ss)
         self.comboBoxPoints.addItem("1", 1)
         self.comboBoxPoints.addItem("3", 3)
         self.comboBoxPoints.addItem("5", 5)
         self.comboBoxPoints.addItem("9", 9)
         self.comboBoxPoints.setCurrentIndex(1)
+        points_row.addWidget(self.label_points)
+        points_row.addWidget(self.comboBoxPoints, stretch=1)
+        cal_layout.addLayout(points_row)
 
         self.pushButtonStartCalibration = QtWidgets.QPushButton("Start Calibration")
+        self.pushButtonStartCalibration.setStyleSheet(btn_ss)
         self.pushButtonStartCalibration.setEnabled(False)
         self.pushButtonCancelCalibration = QtWidgets.QPushButton("Stop Calibration")
+        self.pushButtonCancelCalibration.setStyleSheet(btn_ss)
+        cal_layout.addWidget(self.pushButtonStartCalibration)
+        cal_layout.addWidget(self.pushButtonCancelCalibration)
+        sidebar.addWidget(cal_group)
 
-        # Left Pupil group
-        self.groupBox_left_pupil = QtWidgets.QGroupBox("Left Pupil")
-        left_pupil_layout = QtWidgets.QGridLayout(self.groupBox_left_pupil)
-        self.label_lp_x_title = QtWidgets.QLabel("X")
-        self.label_lp_y_title = QtWidgets.QLabel("Y")
-        self.labelLeftPupilCenterX = QtWidgets.QLabel("")
-        self.labelLeftPupilCenterX.setFrameShape(QtWidgets.QFrame.WinPanel)
-        self.labelLeftPupilCenterX.setFrameShadow(QtWidgets.QFrame.Sunken)
-        self.labelLeftPupilCenterY = QtWidgets.QLabel("")
-        self.labelLeftPupilCenterY.setFrameShape(QtWidgets.QFrame.WinPanel)
-        self.labelLeftPupilCenterY.setFrameShadow(QtWidgets.QFrame.Sunken)
-        left_pupil_layout.addWidget(self.label_lp_x_title, 0, 0)
-        left_pupil_layout.addWidget(self.labelLeftPupilCenterX, 0, 1)
-        left_pupil_layout.addWidget(self.label_lp_y_title, 1, 0)
-        left_pupil_layout.addWidget(self.labelLeftPupilCenterY, 1, 1)
+        # Separator
+        sep2 = QtWidgets.QFrame()
+        sep2.setFrameShape(QtWidgets.QFrame.HLine)
+        sep2.setStyleSheet(separator_ss)
+        sidebar.addWidget(sep2)
 
-        # Right Pupil group
-        self.groupBox_right_pupil = QtWidgets.QGroupBox("Right Pupil")
-        right_pupil_layout = QtWidgets.QGridLayout(self.groupBox_right_pupil)
-        self.label_rp_x_title = QtWidgets.QLabel("X")
-        self.label_rp_y_title = QtWidgets.QLabel("Y")
-        self.labelRightPupilCenterX = QtWidgets.QLabel("")
-        self.labelRightPupilCenterX.setFrameShape(QtWidgets.QFrame.WinPanel)
-        self.labelRightPupilCenterX.setFrameShadow(QtWidgets.QFrame.Sunken)
-        self.labelRightPupilCenterY = QtWidgets.QLabel("")
-        self.labelRightPupilCenterY.setFrameShape(QtWidgets.QFrame.WinPanel)
-        self.labelRightPupilCenterY.setFrameShadow(QtWidgets.QFrame.Sunken)
-        right_pupil_layout.addWidget(self.label_rp_x_title, 0, 0)
-        right_pupil_layout.addWidget(self.labelRightPupilCenterX, 0, 1)
-        right_pupil_layout.addWidget(self.label_rp_y_title, 1, 0)
-        right_pupil_layout.addWidget(self.labelRightPupilCenterY, 1, 1)
+        # -- Data readouts --
+        title_ss = f"font-size: 11px; color: {t['label_color']}; font-weight: bold;"
 
-        # Recommend Gaze group
         self.groupBox_gaze = QtWidgets.QGroupBox("Recommend Gaze")
+        self.groupBox_gaze.setStyleSheet(group_ss)
         gaze_layout = QtWidgets.QGridLayout(self.groupBox_gaze)
+        gaze_layout.setContentsMargins(8, 4, 8, 6)
+        gaze_layout.setHorizontalSpacing(6)
+        gaze_layout.setVerticalSpacing(4)
         self.label_gaze_x_title = QtWidgets.QLabel("X")
+        self.label_gaze_x_title.setStyleSheet(title_ss)
         self.label_gaze_y_title = QtWidgets.QLabel("Y")
+        self.label_gaze_y_title.setStyleSheet(title_ss)
         self.labelGazeX = QtWidgets.QLabel("")
-        self.labelGazeX.setFrameShape(QtWidgets.QFrame.WinPanel)
-        self.labelGazeX.setFrameShadow(QtWidgets.QFrame.Sunken)
+        self.labelGazeX.setStyleSheet(value_ss)
         self.labelGazeY = QtWidgets.QLabel("")
-        self.labelGazeY.setFrameShape(QtWidgets.QFrame.WinPanel)
-        self.labelGazeY.setFrameShadow(QtWidgets.QFrame.Sunken)
+        self.labelGazeY.setStyleSheet(value_ss)
         gaze_layout.addWidget(self.label_gaze_x_title, 0, 0)
         gaze_layout.addWidget(self.labelGazeX, 0, 1)
         gaze_layout.addWidget(self.label_gaze_y_title, 1, 0)
         gaze_layout.addWidget(self.labelGazeY, 1, 1)
 
-        # Metrics (rate, count, log)
-        self.rate_label = QtWidgets.QLabel("Rate: -- Hz")
-        self.count_label = QtWidgets.QLabel("Samples: 0")
-        self.log_label = QtWidgets.QLabel("Log: --")
+        self.groupBox_left_pupil = QtWidgets.QGroupBox("Left Pupil")
+        self.groupBox_left_pupil.setStyleSheet(group_ss)
+        left_pupil_layout = QtWidgets.QGridLayout(self.groupBox_left_pupil)
+        left_pupil_layout.setContentsMargins(8, 4, 8, 6)
+        left_pupil_layout.setHorizontalSpacing(6)
+        left_pupil_layout.setVerticalSpacing(4)
+        self.label_lp_x_title = QtWidgets.QLabel("X")
+        self.label_lp_x_title.setStyleSheet(title_ss)
+        self.label_lp_y_title = QtWidgets.QLabel("Y")
+        self.label_lp_y_title.setStyleSheet(title_ss)
+        self.labelLeftPupilCenterX = QtWidgets.QLabel("")
+        self.labelLeftPupilCenterX.setStyleSheet(value_ss)
+        self.labelLeftPupilCenterY = QtWidgets.QLabel("")
+        self.labelLeftPupilCenterY.setStyleSheet(value_ss)
+        left_pupil_layout.addWidget(self.label_lp_x_title, 0, 0)
+        left_pupil_layout.addWidget(self.labelLeftPupilCenterX, 0, 1)
+        left_pupil_layout.addWidget(self.label_lp_y_title, 1, 0)
+        left_pupil_layout.addWidget(self.labelLeftPupilCenterY, 1, 1)
 
-        # === Main content area ===
-        # Scene image label (clickable, matching official sample)
+        self.groupBox_right_pupil = QtWidgets.QGroupBox("Right Pupil")
+        self.groupBox_right_pupil.setStyleSheet(group_ss)
+        right_pupil_layout = QtWidgets.QGridLayout(self.groupBox_right_pupil)
+        right_pupil_layout.setContentsMargins(8, 4, 8, 6)
+        right_pupil_layout.setHorizontalSpacing(6)
+        right_pupil_layout.setVerticalSpacing(4)
+        self.label_rp_x_title = QtWidgets.QLabel("X")
+        self.label_rp_x_title.setStyleSheet(title_ss)
+        self.label_rp_y_title = QtWidgets.QLabel("Y")
+        self.label_rp_y_title.setStyleSheet(title_ss)
+        self.labelRightPupilCenterX = QtWidgets.QLabel("")
+        self.labelRightPupilCenterX.setStyleSheet(value_ss)
+        self.labelRightPupilCenterY = QtWidgets.QLabel("")
+        self.labelRightPupilCenterY.setStyleSheet(value_ss)
+        right_pupil_layout.addWidget(self.label_rp_x_title, 0, 0)
+        right_pupil_layout.addWidget(self.labelRightPupilCenterX, 0, 1)
+        right_pupil_layout.addWidget(self.label_rp_y_title, 1, 0)
+        right_pupil_layout.addWidget(self.labelRightPupilCenterY, 1, 1)
+
+        sidebar.addWidget(self.groupBox_gaze)
+        sidebar.addWidget(self.groupBox_left_pupil)
+        sidebar.addWidget(self.groupBox_right_pupil)
+
+        sidebar.addStretch()
+        body.addLayout(sidebar)
+
+        # ---------- Right content area ----------
+        right = QtWidgets.QVBoxLayout()
+        right.setSpacing(8)
+        right.setContentsMargins(0, 0, 0, 0)
+
+        # -- Scene image --
         self.labelSceneImage = SceneImageLabel()
         self.labelSceneImage.connect_customized_slot(self._on_scene_image_area_clicked)
-        self.labelSceneImage.setFrameShape(QtWidgets.QFrame.WinPanel)
-        self.labelSceneImage.setFrameShadow(QtWidgets.QFrame.Sunken)
-        self.labelSceneImage.setText("scene image area")
+        self.labelSceneImage.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        self.labelSceneImage.setStyleSheet(
+            f"QLabel {{ background: {t['value_bg']}; border: 1px solid {t['group_border']}; "
+            f"border-radius: 6px; }}"
+        )
+        self.labelSceneImage.setText("Scene Image")
+        self.labelSceneImage.setAlignment(Qt.AlignCenter)
         self.labelSceneImage.setMinimumSize(640, 360)
+        right.addWidget(self.labelSceneImage, stretch=3)
 
-        # Eye images
-        self.labelLeftEyeImage = QtWidgets.QLabel("left eye image")
-        self.labelLeftEyeImage.setFrameShape(QtWidgets.QFrame.WinPanel)
-        self.labelLeftEyeImage.setFrameShadow(QtWidgets.QFrame.Sunken)
-        self.labelLeftEyeImage.setFixedSize(160, 120)
+        # -- Eye images row --
+        eye_row = QtWidgets.QHBoxLayout()
+        eye_row.setSpacing(8)
 
-        self.labelRightEyeImage = QtWidgets.QLabel("right eye image")
-        self.labelRightEyeImage.setFrameShape(QtWidgets.QFrame.WinPanel)
-        self.labelRightEyeImage.setFrameShadow(QtWidgets.QFrame.Sunken)
-        self.labelRightEyeImage.setFixedSize(160, 120)
+        left_eye_container = QtWidgets.QVBoxLayout()
+        left_eye_container.setSpacing(2)
+        left_eye_title = QtWidgets.QLabel("Left Eye")
+        left_eye_title.setStyleSheet(f"font-size: 11px; color: {t['label_color']}; font-weight: bold;")
+        left_eye_title.setAlignment(Qt.AlignCenter)
+        self.labelLeftEyeImage = QtWidgets.QLabel("left eye")
+        self.labelLeftEyeImage.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        self.labelLeftEyeImage.setStyleSheet(
+            f"QLabel {{ background: {t['value_bg']}; border: 1px solid {t['group_border']}; "
+            f"border-radius: 4px; }}"
+        )
+        self.labelLeftEyeImage.setAlignment(Qt.AlignCenter)
+        self.labelLeftEyeImage.setFixedSize(200, 150)
+        self.labelLeftEyeImage.setScaledContents(False)
+        left_eye_container.addWidget(left_eye_title)
+        left_eye_container.addWidget(self.labelLeftEyeImage)
 
-        # pyqtgraph plots (secondary, below scene image)
-        pg.setConfigOptions(antialias=False, useOpenGL=False)
-        self.gaze_plot = pg.PlotWidget(title="Gaze X / Y")
-        self.gaze_plot.showGrid(x=True, y=True, alpha=0.2)
-        self.gaze_plot.setLabel("bottom", "Time (s)")
-        self.gaze_plot.setLabel("left", "Pixels")
+        right_eye_container = QtWidgets.QVBoxLayout()
+        right_eye_container.setSpacing(2)
+        right_eye_title = QtWidgets.QLabel("Right Eye")
+        right_eye_title.setStyleSheet(f"font-size: 11px; color: {t['label_color']}; font-weight: bold;")
+        right_eye_title.setAlignment(Qt.AlignCenter)
+        self.labelRightEyeImage = QtWidgets.QLabel("right eye")
+        self.labelRightEyeImage.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        self.labelRightEyeImage.setStyleSheet(
+            f"QLabel {{ background: {t['value_bg']}; border: 1px solid {t['group_border']}; "
+            f"border-radius: 4px; }}"
+        )
+        self.labelRightEyeImage.setAlignment(Qt.AlignCenter)
+        self.labelRightEyeImage.setFixedSize(200, 150)
+        self.labelRightEyeImage.setScaledContents(False)
+        right_eye_container.addWidget(right_eye_title)
+        right_eye_container.addWidget(self.labelRightEyeImage)
+
+        eye_row.addLayout(left_eye_container)
+        eye_row.addLayout(right_eye_container)
+        eye_row.addStretch()
+        right.addLayout(eye_row)
+
+        # -- Plots --
+        pg.setConfigOptions(
+            antialias=False, useOpenGL=False,
+            background=t['bg'], foreground=t['fg'],
+        )
+
+        self.gaze_plot = pg.PlotWidget()
+        gaze_item = self.gaze_plot.getPlotItem()
+        gaze_item.setTitle("Gaze X / Y")
+        gaze_item.setLabel("bottom", "Time", units="s")
+        gaze_item.setLabel("left", "Pixels")
+        gaze_item.showGrid(x=True, y=True, alpha=t['grid_alpha'])
+        gaze_item.setMenuEnabled(False)
+        gaze_item.setMouseEnabled(x=False, y=False)
+        gaze_item.setXRange(-self.window_seconds, 0.0, padding=0.0)
+        gaze_item.addLegend(offset=(6, 6))
         self.gaze_x_curve = self.gaze_plot.plot(pen=pg.mkPen("#4ED1A6", width=2), name="Gaze X")
         self.gaze_y_curve = self.gaze_plot.plot(pen=pg.mkPen("#FF7F50", width=2), name="Gaze Y")
 
-        self.pupil_plot = pg.PlotWidget(title="Pupil Diameter (mm)")
-        self.pupil_plot.showGrid(x=True, y=True, alpha=0.2)
-        self.pupil_plot.setLabel("bottom", "Time (s)")
-        self.pupil_plot.setLabel("left", "Diameter (mm)")
+        self.pupil_plot = pg.PlotWidget()
+        pupil_item = self.pupil_plot.getPlotItem()
+        pupil_item.setTitle("Pupil Diameter (mm)")
+        pupil_item.setLabel("bottom", "Time", units="s")
+        pupil_item.setLabel("left", "Diameter", units="mm")
+        pupil_item.showGrid(x=True, y=True, alpha=t['grid_alpha'])
+        pupil_item.setMenuEnabled(False)
+        pupil_item.setMouseEnabled(x=False, y=False)
+        pupil_item.setXRange(-self.window_seconds, 0.0, padding=0.0)
+        pupil_item.addLegend(offset=(6, 6))
         self.left_pupil_curve = self.pupil_plot.plot(pen=pg.mkPen("#9AD1FF", width=2), name="Left")
         self.right_pupil_curve = self.pupil_plot.plot(pen=pg.mkPen("#FFD166", width=2), name="Right")
 
-        # === Layout assembly ===
-        # Use a horizontal layout: left sidebar | right content
-        main_layout = QtWidgets.QHBoxLayout(central)
-        main_layout.setContentsMargins(4, 4, 4, 4)
-        main_layout.setSpacing(4)
-
-        # Left sidebar
-        sidebar = QtWidgets.QVBoxLayout()
-        sidebar.setSpacing(4)
-        sidebar.addWidget(self.groupBox_env)
-        sidebar.addWidget(self.groupBox_res)
-        sidebar.addWidget(self.pushButtonStart)
-        sidebar.addWidget(self.pushButtonStop)
-
-        points_row = QtWidgets.QHBoxLayout()
-        points_row.addWidget(self.label_points)
-        points_row.addWidget(self.comboBoxPoints)
-        sidebar.addLayout(points_row)
-
-        sidebar.addWidget(self.pushButtonStartCalibration)
-        sidebar.addWidget(self.pushButtonCancelCalibration)
-        sidebar.addWidget(self.groupBox_left_pupil)
-        sidebar.addWidget(self.groupBox_right_pupil)
-        sidebar.addWidget(self.groupBox_gaze)
-
-        sidebar.addWidget(self.rate_label)
-        sidebar.addWidget(self.count_label)
-        sidebar.addWidget(self.log_label)
-
-        sidebar.addStretch()
-        main_layout.addLayout(sidebar)
-
-        # Right content: scene image + eye images on top, plots on bottom
-        right_layout = QtWidgets.QVBoxLayout()
-        right_layout.setSpacing(4)
-
-        # Top row: scene image with eye images below-left
-        scene_area = QtWidgets.QVBoxLayout()
-        scene_area.setSpacing(2)
-        scene_area.addWidget(self.labelSceneImage, stretch=1)
-
-        eye_row = QtWidgets.QHBoxLayout()
-        eye_row.setSpacing(2)
-        eye_row.addWidget(self.labelLeftEyeImage)
-        eye_row.addWidget(self.labelRightEyeImage)
-        eye_row.addStretch()
-        scene_area.addLayout(eye_row)
-
-        right_layout.addLayout(scene_area, stretch=3)
-
-        # Bottom: plots side by side
         plots_row = QtWidgets.QHBoxLayout()
-        plots_row.setSpacing(4)
+        plots_row.setSpacing(8)
         plots_row.addWidget(self.gaze_plot)
         plots_row.addWidget(self.pupil_plot)
-        right_layout.addLayout(plots_row, stretch=1)
+        right.addLayout(plots_row, stretch=2)
 
-        main_layout.addLayout(right_layout, stretch=1)
+        body.addLayout(right, stretch=1)
 
     def _connect_signals(self):
         # Button signals
@@ -685,6 +892,10 @@ def parse_args():
 
 
 def main():
+    if hasattr(QtCore.Qt, 'AA_EnableHighDpiScaling'):
+        QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+    if hasattr(QtCore.Qt, 'AA_UseHighDpiPixmaps'):
+        QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
     args = parse_args()
     app = QtWidgets.QApplication(sys.argv)
     window = EyeTrackerMonitorWindow(args.sdk_root, args.sample_rate, args.window_seconds)
