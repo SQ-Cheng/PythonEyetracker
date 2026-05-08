@@ -86,12 +86,13 @@ def detect_dark_theme():
 
 # ===================== Utility Classes =====================
 class SceneImageLabel(QtWidgets.QLabel):
-    button_clicked_signal = QtCore.pyqtSignal(int, int)
+    button_clicked_signal = QtCore.pyqtSignal(float, float)
     def __init__(self, parent=None):
         super().__init__(parent)
     def mousePressEvent(self, ev):
         if ev.buttons() == Qt.LeftButton:
-            self.button_clicked_signal.emit(ev.x(), ev.y())
+            if self.width() > 0 and self.height() > 0:
+                self.button_clicked_signal.emit(ev.x() / self.width(), ev.y() / self.height())
     def connect_customized_slot(self, slot_func):
         self.button_clicked_signal.connect(slot_func)
 
@@ -542,6 +543,7 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.labelSceneImage.setStyleSheet(f"QLabel {{ background: {t['value_bg']}; border: 1px solid {t['group_border']}; border-radius: 6px; }}")
         self.labelSceneImage.setAlignment(Qt.AlignCenter)
         self.labelSceneImage.setMinimumSize(640, 360)
+        self.labelSceneImage.setScaledContents(True)
         scene_eye_row.addWidget(self.labelSceneImage, stretch=3)
         
         eyes_col = QtWidgets.QVBoxLayout()
@@ -682,15 +684,25 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
     def _on_set_calibration_finish(self, eye, index, error):
         self.finish_points[index - 1][eye] = error
         n = self.current_points
-        # (Simplified calibration end check logic)
-        err = False
-        if n == 1: err = (1 != self.finish_points[0][0] and 1 != self.finish_points[0][1])
-        if err: self._on_stop_calibration()
+        if n == 1:
+            if 1 != self.finish_points[0][0] and 1 != self.finish_points[0][1]:
+                self._on_stop_calibration()
+        elif n == 3:
+            if (1 != self.finish_points[0][0] and 1 != self.finish_points[0][1] and
+                1 != self.finish_points[1][0] and 1 != self.finish_points[1][1] and
+                1 != self.finish_points[2][0] and 1 != self.finish_points[2][1]):
+                self._on_stop_calibration()
+        elif n == 5:
+            if all(1 != self.finish_points[i][e] for i in range(5) for e in range(2)):
+                self._on_stop_calibration()
+        elif n == 9:
+            if all(1 != self.finish_points[i][e] for i in range(9) for e in range(2)):
+                self._on_stop_calibration()
 
-    def _on_scene_clicked(self, x, y):
+    def _on_scene_clicked(self, norm_x, norm_y):
         if not self.eye_sdk_running: return
-        px = float(x) - float(self.scene_width / 2)
-        py = float(y) - float(self.scene_height / 2)
+        px = norm_x * self.scene_width - (self.scene_width / 2)
+        py = norm_y * self.scene_height - (self.scene_height / 2)
         self.eye_sdk.set_current_point(px, py)
 
     def _on_start_calibration(self):
@@ -767,6 +779,15 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         if self.calibration_is_running: self._on_stop_calibration()
         self.eye_sdk.stop()
         if self.eye_csv_writer: self.eye_csv_writer.stop()
+        
+        print("\n===== Logging Session Summary =====")
+        print(f"Sensor Total Packets:    {self.sensor_rate_tracker.total_packets}")
+        if self.sensor_csv_writer:
+            print(f"Sensor Log Output:       {self.sensor_csv_writer.output_file}")
+        print(f"Eye Tracker Data Frames: {self.eye_packet_count}")
+        if self.eye_csv_writer:
+            print(f"Eye Tracker Log Output:  {self.eye_csv_writer.output_file}")
+        print("===================================\n")
 
     # ---- Timer Update ----
     def _on_timer(self):
