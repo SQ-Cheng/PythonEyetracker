@@ -97,7 +97,49 @@ COLUMN_NAMES = [
 ]
 
 
-class SceneImageLabel(QtWidgets.QLabel):
+class AspectRatioPixmapLabel(QtWidgets.QLabel):
+    """QLabel that scales pixmaps to fit while preserving aspect ratio."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._source_pixmap = QPixmap()
+
+    def setPixmap(self, pixmap):
+        self._source_pixmap = QPixmap(pixmap)
+        self._update_scaled_pixmap()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_scaled_pixmap()
+
+    def displayed_pixmap_rect(self):
+        pixmap = super().pixmap()
+        if pixmap is None or pixmap.isNull():
+            return self.contentsRect()
+
+        contents = self.contentsRect()
+        x = contents.x() + (contents.width() - pixmap.width()) // 2
+        y = contents.y() + (contents.height() - pixmap.height()) // 2
+        return QtCore.QRect(x, y, pixmap.width(), pixmap.height())
+
+    def _update_scaled_pixmap(self):
+        if self._source_pixmap.isNull():
+            super().setPixmap(QPixmap())
+            return
+
+        contents = self.contentsRect()
+        if contents.width() <= 0 or contents.height() <= 0:
+            return
+
+        scaled = self._source_pixmap.scaled(
+            contents.size(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        super().setPixmap(scaled)
+
+
+class SceneImageLabel(AspectRatioPixmapLabel):
     """Clickable QLabel for scene camera image (matching official sample)."""
 
     button_clicked_signal = QtCore.pyqtSignal(float, float)
@@ -107,7 +149,11 @@ class SceneImageLabel(QtWidgets.QLabel):
 
     def mousePressEvent(self, ev):
         if ev.buttons() == Qt.LeftButton:
-            self.button_clicked_signal.emit(ev.x() / self.width(), ev.y() / self.height())
+            target_rect = self.displayed_pixmap_rect()
+            if target_rect.width() > 0 and target_rect.height() > 0 and target_rect.contains(ev.pos()):
+                norm_x = (ev.x() - target_rect.x()) / target_rect.width()
+                norm_y = (ev.y() - target_rect.y()) / target_rect.height()
+                self.button_clicked_signal.emit(norm_x, norm_y)
 
     def connect_customized_slot(self, slot_func):
         self.button_clicked_signal.connect(slot_func)
@@ -285,6 +331,9 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         # Theme
         self.theme = THEME_DARK if detect_dark_theme() else THEME_LIGHT
         t = self.theme
+        mono_font = QFont("Consolas", 12)
+        mono_font.setStyleHint(QFont.TypeWriter)
+        value_width = QtGui.QFontMetrics(mono_font).horizontalAdvance("-0000.0000") + 16
 
         self.setWindowTitle("Eye Tracker Monitor")
         self.resize(1500, 900)
@@ -384,10 +433,12 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         sidebar = QtWidgets.QVBoxLayout()
         sidebar.setSpacing(6)
         sidebar.setContentsMargins(0, 0, 0, 0)
+        sidebar_width = 240
 
         # -- Device section --
         self.groupBox_env = QtWidgets.QGroupBox("Environment")
         self.groupBox_env.setStyleSheet(group_ss)
+        self.groupBox_env.setFixedWidth(sidebar_width)
         env_layout = QtWidgets.QVBoxLayout(self.groupBox_env)
         env_layout.setContentsMargins(8, 4, 8, 6)
         env_layout.setSpacing(4)
@@ -401,6 +452,7 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
 
         self.groupBox_res = QtWidgets.QGroupBox("Resolution")
         self.groupBox_res.setStyleSheet(group_ss)
+        self.groupBox_res.setFixedWidth(sidebar_width)
         res_layout = QtWidgets.QVBoxLayout(self.groupBox_res)
         res_layout.setContentsMargins(8, 4, 8, 6)
         res_layout.setSpacing(4)
@@ -419,9 +471,11 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         # -- Control buttons --
         self.pushButtonStart = QtWidgets.QPushButton("▶  Start")
         self.pushButtonStart.setStyleSheet(btn_ss)
+        self.pushButtonStart.setFixedWidth(sidebar_width)
         self.pushButtonStop = QtWidgets.QPushButton("■  Stop")
         self.pushButtonStop.setStyleSheet(btn_ss)
         self.pushButtonStop.setEnabled(False)
+        self.pushButtonStop.setFixedWidth(sidebar_width)
         sidebar.addWidget(self.pushButtonStart)
         sidebar.addWidget(self.pushButtonStop)
 
@@ -434,6 +488,7 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         # -- Calibration section --
         cal_group = QtWidgets.QGroupBox("Calibration")
         cal_group.setStyleSheet(group_ss)
+        cal_group.setFixedWidth(sidebar_width)
         cal_layout = QtWidgets.QVBoxLayout(cal_group)
         cal_layout.setContentsMargins(8, 4, 8, 6)
         cal_layout.setSpacing(4)
@@ -473,18 +528,28 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
 
         self.groupBox_gaze = QtWidgets.QGroupBox("Recommend Gaze")
         self.groupBox_gaze.setStyleSheet(group_ss)
+        self.groupBox_gaze.setFixedWidth(sidebar_width)
         gaze_layout = QtWidgets.QGridLayout(self.groupBox_gaze)
         gaze_layout.setContentsMargins(8, 4, 8, 6)
         gaze_layout.setHorizontalSpacing(6)
         gaze_layout.setVerticalSpacing(4)
+        gaze_layout.setColumnMinimumWidth(0, 16)
+        gaze_layout.setColumnMinimumWidth(1, value_width)
+        gaze_layout.setColumnStretch(1, 1)
         self.label_gaze_x_title = QtWidgets.QLabel("X")
         self.label_gaze_x_title.setStyleSheet(title_ss)
         self.label_gaze_y_title = QtWidgets.QLabel("Y")
         self.label_gaze_y_title.setStyleSheet(title_ss)
         self.labelGazeX = QtWidgets.QLabel("")
         self.labelGazeX.setStyleSheet(value_ss)
+        self.labelGazeX.setFont(mono_font)
+        self.labelGazeX.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.labelGazeX.setFixedWidth(value_width)
         self.labelGazeY = QtWidgets.QLabel("")
         self.labelGazeY.setStyleSheet(value_ss)
+        self.labelGazeY.setFont(mono_font)
+        self.labelGazeY.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.labelGazeY.setFixedWidth(value_width)
         gaze_layout.addWidget(self.label_gaze_x_title, 0, 0)
         gaze_layout.addWidget(self.labelGazeX, 0, 1)
         gaze_layout.addWidget(self.label_gaze_y_title, 1, 0)
@@ -492,18 +557,28 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
 
         self.groupBox_left_pupil = QtWidgets.QGroupBox("Left Pupil")
         self.groupBox_left_pupil.setStyleSheet(group_ss)
+        self.groupBox_left_pupil.setFixedWidth(sidebar_width)
         left_pupil_layout = QtWidgets.QGridLayout(self.groupBox_left_pupil)
         left_pupil_layout.setContentsMargins(8, 4, 8, 6)
         left_pupil_layout.setHorizontalSpacing(6)
         left_pupil_layout.setVerticalSpacing(4)
+        left_pupil_layout.setColumnMinimumWidth(0, 16)
+        left_pupil_layout.setColumnMinimumWidth(1, value_width)
+        left_pupil_layout.setColumnStretch(1, 1)
         self.label_lp_x_title = QtWidgets.QLabel("X")
         self.label_lp_x_title.setStyleSheet(title_ss)
         self.label_lp_y_title = QtWidgets.QLabel("Y")
         self.label_lp_y_title.setStyleSheet(title_ss)
         self.labelLeftPupilCenterX = QtWidgets.QLabel("")
         self.labelLeftPupilCenterX.setStyleSheet(value_ss)
+        self.labelLeftPupilCenterX.setFont(mono_font)
+        self.labelLeftPupilCenterX.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.labelLeftPupilCenterX.setFixedWidth(value_width)
         self.labelLeftPupilCenterY = QtWidgets.QLabel("")
         self.labelLeftPupilCenterY.setStyleSheet(value_ss)
+        self.labelLeftPupilCenterY.setFont(mono_font)
+        self.labelLeftPupilCenterY.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.labelLeftPupilCenterY.setFixedWidth(value_width)
         left_pupil_layout.addWidget(self.label_lp_x_title, 0, 0)
         left_pupil_layout.addWidget(self.labelLeftPupilCenterX, 0, 1)
         left_pupil_layout.addWidget(self.label_lp_y_title, 1, 0)
@@ -511,18 +586,28 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
 
         self.groupBox_right_pupil = QtWidgets.QGroupBox("Right Pupil")
         self.groupBox_right_pupil.setStyleSheet(group_ss)
+        self.groupBox_right_pupil.setFixedWidth(sidebar_width)
         right_pupil_layout = QtWidgets.QGridLayout(self.groupBox_right_pupil)
         right_pupil_layout.setContentsMargins(8, 4, 8, 6)
         right_pupil_layout.setHorizontalSpacing(6)
         right_pupil_layout.setVerticalSpacing(4)
+        right_pupil_layout.setColumnMinimumWidth(0, 16)
+        right_pupil_layout.setColumnMinimumWidth(1, value_width)
+        right_pupil_layout.setColumnStretch(1, 1)
         self.label_rp_x_title = QtWidgets.QLabel("X")
         self.label_rp_x_title.setStyleSheet(title_ss)
         self.label_rp_y_title = QtWidgets.QLabel("Y")
         self.label_rp_y_title.setStyleSheet(title_ss)
         self.labelRightPupilCenterX = QtWidgets.QLabel("")
         self.labelRightPupilCenterX.setStyleSheet(value_ss)
+        self.labelRightPupilCenterX.setFont(mono_font)
+        self.labelRightPupilCenterX.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.labelRightPupilCenterX.setFixedWidth(value_width)
         self.labelRightPupilCenterY = QtWidgets.QLabel("")
         self.labelRightPupilCenterY.setStyleSheet(value_ss)
+        self.labelRightPupilCenterY.setFont(mono_font)
+        self.labelRightPupilCenterY.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.labelRightPupilCenterY.setFixedWidth(value_width)
         right_pupil_layout.addWidget(self.label_rp_x_title, 0, 0)
         right_pupil_layout.addWidget(self.labelRightPupilCenterX, 0, 1)
         right_pupil_layout.addWidget(self.label_rp_y_title, 1, 0)
@@ -540,7 +625,10 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         right.setSpacing(8)
         right.setContentsMargins(0, 0, 0, 0)
 
-        # -- Scene image --
+        # -- Top visual area --
+        visual_row = QtWidgets.QHBoxLayout()
+        visual_row.setSpacing(8)
+
         self.labelSceneImage = SceneImageLabel()
         self.labelSceneImage.connect_customized_slot(self._on_scene_image_area_clicked)
         self.labelSceneImage.setFrameShape(QtWidgets.QFrame.StyledPanel)
@@ -551,27 +639,25 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         self.labelSceneImage.setText("Scene Image")
         self.labelSceneImage.setAlignment(Qt.AlignCenter)
         self.labelSceneImage.setMinimumSize(640, 360)
-        self.labelSceneImage.setScaledContents(True)
-        right.addWidget(self.labelSceneImage, stretch=3)
+        visual_row.addWidget(self.labelSceneImage, stretch=1)
 
-        # -- Eye images row --
-        eye_row = QtWidgets.QHBoxLayout()
-        eye_row.setSpacing(8)
-
+        eye_column = QtWidgets.QVBoxLayout()
+        eye_column.setSpacing(8)
         left_eye_container = QtWidgets.QVBoxLayout()
         left_eye_container.setSpacing(2)
         left_eye_title = QtWidgets.QLabel("Left Eye")
         left_eye_title.setStyleSheet(f"font-size: 11px; color: {t['label_color']}; font-weight: bold;")
         left_eye_title.setAlignment(Qt.AlignCenter)
-        self.labelLeftEyeImage = QtWidgets.QLabel("left eye")
+        self.labelLeftEyeImage = AspectRatioPixmapLabel()
         self.labelLeftEyeImage.setFrameShape(QtWidgets.QFrame.StyledPanel)
         self.labelLeftEyeImage.setStyleSheet(
             f"QLabel {{ background: {t['value_bg']}; border: 1px solid {t['group_border']}; "
             f"border-radius: 4px; }}"
         )
+        self.labelLeftEyeImage.setText("left eye")
         self.labelLeftEyeImage.setAlignment(Qt.AlignCenter)
-        self.labelLeftEyeImage.setFixedSize(200, 150)
-        self.labelLeftEyeImage.setScaledContents(False)
+        self.labelLeftEyeImage.setMinimumSize(220, 165)
+        self.labelLeftEyeImage.setMaximumWidth(240)
         left_eye_container.addWidget(left_eye_title)
         left_eye_container.addWidget(self.labelLeftEyeImage)
 
@@ -580,22 +666,24 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         right_eye_title = QtWidgets.QLabel("Right Eye")
         right_eye_title.setStyleSheet(f"font-size: 11px; color: {t['label_color']}; font-weight: bold;")
         right_eye_title.setAlignment(Qt.AlignCenter)
-        self.labelRightEyeImage = QtWidgets.QLabel("right eye")
+        self.labelRightEyeImage = AspectRatioPixmapLabel()
         self.labelRightEyeImage.setFrameShape(QtWidgets.QFrame.StyledPanel)
         self.labelRightEyeImage.setStyleSheet(
             f"QLabel {{ background: {t['value_bg']}; border: 1px solid {t['group_border']}; "
             f"border-radius: 4px; }}"
         )
+        self.labelRightEyeImage.setText("right eye")
         self.labelRightEyeImage.setAlignment(Qt.AlignCenter)
-        self.labelRightEyeImage.setFixedSize(200, 150)
-        self.labelRightEyeImage.setScaledContents(False)
+        self.labelRightEyeImage.setMinimumSize(220, 165)
+        self.labelRightEyeImage.setMaximumWidth(240)
         right_eye_container.addWidget(right_eye_title)
         right_eye_container.addWidget(self.labelRightEyeImage)
 
-        eye_row.addLayout(left_eye_container)
-        eye_row.addLayout(right_eye_container)
-        eye_row.addStretch()
-        right.addLayout(eye_row)
+        eye_column.addLayout(left_eye_container)
+        eye_column.addLayout(right_eye_container)
+        eye_column.addStretch()
+        visual_row.addLayout(eye_column)
+        right.addLayout(visual_row, stretch=3)
 
         # -- Plots --
         pg.setConfigOptions(
@@ -674,14 +762,14 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         self.labelRightEyeImage.setPixmap(image)
 
     def _display_pupil_data(self, left_x, left_y, right_x, right_y):
-        self.labelLeftPupilCenterX.setText(str(left_x))
-        self.labelLeftPupilCenterY.setText(str(left_y))
-        self.labelRightPupilCenterX.setText(str(right_x))
-        self.labelRightPupilCenterY.setText(str(right_y))
+        self.labelLeftPupilCenterX.setText(f"{left_x:.5f}")
+        self.labelLeftPupilCenterY.setText(f"{left_y:.5f}")
+        self.labelRightPupilCenterX.setText(f"{right_x:.5f}")
+        self.labelRightPupilCenterY.setText(f"{right_y:.5f}")
 
     def _display_gaze_data(self, x, y):
-        self.labelGazeX.setText(str(x))
-        self.labelGazeY.setText(str(y))
+        self.labelGazeX.setText(f"{x:.5f}")
+        self.labelGazeY.setText(f"{y:.5f}")
         # Convert from center-origin to top-left-origin for drawing (matching official sample)
         self.cur_gaze_x = (x + self.scene_width / 2)
         self.cur_gaze_y = (y + self.scene_height / 2)

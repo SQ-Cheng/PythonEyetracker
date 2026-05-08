@@ -20,9 +20,10 @@ from datetime import datetime
 
 import numpy as np
 import serial
+from serial.tools import list_ports
 
 from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtGui import QPainter, QColor, QBrush, QPen, QPixmap
+from PyQt5.QtGui import QPainter, QColor, QBrush, QPen, QPixmap, QFont
 from PyQt5.QtCore import Qt, QRectF
 import pyqtgraph as pg
 
@@ -34,16 +35,21 @@ from sdk_wrapper import wrapper
 # ===================== Constants =====================
 # Sensor
 PACKET_SIZE = 64
+SYNC_PACKET_SIZE = 80
 NUM_FLOATS = 14
 SYNC_MARKER = bytes([0x55, 0xAA, 0x55, 0xAA])
 SYNC_LEN = 4
+SYNC_PACKET_FORMAT = '<14fIIHH8x'
 
-DISPLAY_WINDOW_SECONDS = 10.0
+DISPLAY_WINDOW_SECONDS = 6.0
 PLOT_UPDATE_INTERVAL_MS = 33
 METRIC_UPDATE_INTERVAL_MS = 250
 Y_LIMIT_UPDATE_INTERVAL_MS = 500
 SERIAL_STARTUP_SETTLE_SECONDS = 2.0
 RATE_WINDOW_SECONDS = 3.0
+TARGET_SERIAL_DESCRIPTION = "Silicon Labs CP210x USB to UART Bridge"
+CALIBRATION_PROFILE_DIR = "calibration_profiles"
+SYNC_EVENT_RETENTION_SECONDS = 5.0
 
 SENSOR_COLUMN_NAMES = [
     'Red', 'IR', 'Green',
@@ -85,16 +91,70 @@ def detect_dark_theme():
 
 
 # ===================== Utility Classes =====================
-class SceneImageLabel(QtWidgets.QLabel):
-    button_clicked_signal = QtCore.pyqtSignal(float, float)
+class AspectRatioPixmapLabel(QtWidgets.QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._source_pixmap = QPixmap()
+
+    def setPixmap(self, pixmap):
+        self._source_pixmap = QPixmap(pixmap)
+        self._update_scaled_pixmap()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_scaled_pixmap()
+
+    def displayed_pixmap_rect(self):
+        pixmap = super().pixmap()
+        if pixmap is None or pixmap.isNull():
+            return self.contentsRect()
+
+        contents = self.contentsRect()
+        x = contents.x() + (contents.width() - pixmap.width()) // 2
+        y = contents.y() + (contents.height() - pixmap.height()) // 2
+        return QtCore.QRect(x, y, pixmap.width(), pixmap.height())
+
+    def _update_scaled_pixmap(self):
+        if self._source_pixmap.isNull():
+            super().setPixmap(QPixmap())
+            return
+
+        contents = self.contentsRect()
+        if contents.width() <= 0 or contents.height() <= 0:
+            return
+
+        scaled = self._source_pixmap.scaled(
+            contents.size(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        super().setPixmap(scaled)
+
+
+class SceneImageLabel(AspectRatioPixmapLabel):
+    button_clicked_signal = QtCore.pyqtSignal(float, float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
     def mousePressEvent(self, ev):
         if ev.buttons() == Qt.LeftButton:
-            if self.width() > 0 and self.height() > 0:
-                self.button_clicked_signal.emit(ev.x() / self.width(), ev.y() / self.height())
+            target_rect = self.displayed_pixmap_rect()
+            if target_rect.width() > 0 and target_rect.height() > 0 and target_rect.contains(ev.pos()):
+                norm_x = (ev.x() - target_rect.x()) / target_rect.width()
+                norm_y = (ev.y() - target_rect.y()) / target_rect.height()
+                self.button_clicked_signal.emit(norm_x, norm_y)
+
     def connect_customized_slot(self, slot_func):
         self.button_clicked_signal.connect(slot_func)
+
+
+class SensorPortComboBox(QtWidgets.QComboBox):
+    popup_requested = QtCore.pyqtSignal()
+
+    def showPopup(self):
+        self.popup_requested.emit()
+        super().showPopup()
 
 
 class PacketRateTracker:
@@ -168,6 +228,64 @@ class RingSeries:
             return [(-self.window_seconds + i * step) for i in range(count)]
 
 
+class AdaptiveRisingEdgeDetector:
+    def __init__(self, history_size=180, min_samples=30, refractory_seconds=0.8):
+        self.history_size = history_size
+        self.min_samples = min_samples
+        self.refractory_seconds = refractory_seconds
+        self.values = deque(maxlen=history_size)
+        self.deltas = deque(maxlen=history_size)
+        self.prev_value = None
+        self.last_event_time = None
+
+    def reset(self):
+        self.values.clear()
+        self.deltas.clear()
+        self.prev_value = None
+        self.last_event_time = None
+
+    def push(self, timestamp, value):
+        value = float(value)
+        if self.prev_value is None:
+            self.prev_value = value
+            self.values.append(value)
+            return None
+
+        delta = value - self.prev_value
+        detected = None
+        if len(self.values) >= self.min_samples and len(self.deltas) >= self.min_samples:
+            value_arr = np.asarray(self.values, dtype=np.float64)
+            delta_arr = np.asarray(self.deltas, dtype=np.float64)
+            value_med = float(np.median(value_arr))
+            delta_med = float(np.median(delta_arr))
+            value_mad = self._mad(value_arr, value_med)
+            delta_mad = self._mad(delta_arr, delta_med)
+            slope_score = (delta - delta_med) / delta_mad
+            level_score = (value - value_med) / value_mad
+            refractory_ok = (
+                self.last_event_time is None
+                or timestamp - self.last_event_time >= self.refractory_seconds
+            )
+            if refractory_ok and slope_score >= 8.0 and level_score >= 3.0:
+                self.last_event_time = timestamp
+                detected = {
+                    "time": float(timestamp),
+                    "value": value,
+                    "slope_score": float(slope_score),
+                    "level_score": float(level_score),
+                }
+
+        self.values.append(value)
+        self.deltas.append(delta)
+        self.prev_value = value
+        return detected
+
+    @staticmethod
+    def _mad(values, median):
+        mad = float(np.median(np.abs(values - median)))
+        return max(mad * 1.4826, 1e-9)
+
+
 class MultiSeriesBuffer:
     def __init__(self, sample_rate_hz, window_seconds):
         self.red = RingSeries(sample_rate_hz, window_seconds, True)
@@ -208,39 +326,67 @@ def sync_timestamps(ser, rounds=20):
     return best_offset
 
 class SerialPacketReader:
-    def __init__(self, port, baudrate):
+    def __init__(self, port, baudrate, packet_mode="normal"):
         self.port = port
         self.baudrate = baudrate
+        self.packet_mode = packet_mode
+        self.packet_size = SYNC_PACKET_SIZE if packet_mode == "sync" else PACKET_SIZE
         self.serial_port = None
         self.packet_queue = queue.SimpleQueue()
+        self.ack_queue = queue.SimpleQueue()
         self._buffer = bytearray()
+        self._text_buffer = bytearray()
         self._write_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread = None
+        self._thread_started = False
 
-    def start(self):
+    def open(self):
         try:
             self.serial_port = serial.Serial(port=self.port, baudrate=self.baudrate, timeout=0.05)
             self._stop_event.clear()
-            self._thread = threading.Thread(target=self._read_loop, daemon=True)
-            self._thread.start()
             return True
         except Exception as e:
             print(f"Serial conn err: {e}")
+            self.serial_port = None
+            return False
+
+    def start(self):
+        if not self.serial_port and not self.open():
+            return False
+        if self._thread_started:
+            return True
+        try:
+            self._thread = threading.Thread(target=self._read_loop, daemon=True)
+            self._thread.start()
+            self._thread_started = True
+            return True
+        except Exception as e:
+            print(f"Serial reader err: {e}")
             return False
 
     def stop(self):
         self._stop_event.set()
-        if self._thread:
+        if self._thread_started and self._thread:
             self._thread.join(timeout=1.0)
         if self.serial_port and self.serial_port.is_open:
             self.serial_port.close()
+        self._thread_started = False
+        self._thread = None
 
     def send_command(self, command_text):
         if not self.serial_port or not self.serial_port.is_open: return
         with self._write_lock:
             self.serial_port.write(command_text.encode("ascii"))
             self.serial_port.flush()
+
+    def send_sync_start(self, sync_id):
+        if not self.serial_port or not self.serial_port.is_open:
+            return None
+        with self._write_lock:
+            self.serial_port.write(f"SYNC_START {int(sync_id)}\n".encode("ascii"))
+            self.serial_port.flush()
+            return time.perf_counter()
 
     def _read_loop(self):
         while not self._stop_event.is_set():
@@ -257,27 +403,85 @@ class SerialPacketReader:
         while True:
             start_index = self._buffer.find(SYNC_MARKER)
             if start_index < 0:
-                if self._buffer and self._buffer[-1] == SYNC_MARKER[0]:
-                    self._buffer[:] = self._buffer[-1:]
-                else: self._buffer.clear()
+                preserve = self._marker_prefix_len()
+                if preserve:
+                    self._consume_text_preamble(bytes(self._buffer[:-preserve]))
+                    self._buffer[:] = self._buffer[-preserve:]
+                else:
+                    self._consume_text_preamble(bytes(self._buffer))
+                    self._buffer.clear()
                 return
-            if start_index > 0: del self._buffer[:start_index]
-            if len(self._buffer) < PACKET_SIZE: return
-            payload = bytes(self._buffer[SYNC_LEN:PACKET_SIZE])
-            del self._buffer[:PACKET_SIZE]
-            try: values = struct.unpack('<14f', payload[:NUM_FLOATS * 4])
+            if start_index > 0:
+                self._consume_text_preamble(bytes(self._buffer[:start_index]))
+                del self._buffer[:start_index]
+            if len(self._buffer) < self.packet_size: return
+            payload = bytes(self._buffer[SYNC_LEN:self.packet_size])
+            del self._buffer[:self.packet_size]
+            try:
+                if self.packet_mode == "sync":
+                    unpacked = struct.unpack(SYNC_PACKET_FORMAT, payload)
+                    values = unpacked[:NUM_FLOATS]
+                    sync_trigger_us = int(unpacked[NUM_FLOATS])
+                    sample_us = int(unpacked[NUM_FLOATS + 1])
+                    sync_id = int(unpacked[NUM_FLOATS + 2])
+                    sync_flags = int(unpacked[NUM_FLOATS + 3])
+                else:
+                    values = struct.unpack('<14f', payload[:NUM_FLOATS * 4])
+                    sync_trigger_us = None
+                    sample_us = None
+                    sync_id = None
+                    sync_flags = None
             except struct.error: continue
 
             if sum(1 for v in values if v != v) > 3: continue
             timestamp = values[13]
             if timestamp == timestamp and (timestamp < 0 or timestamp > 4.3e9): continue
 
-            self.packet_queue.put({
+            packet = {
                 "timestamp": time.perf_counter(), "red": values[0], "ir": values[1], "green": values[2],
                 "ax": values[3], "ay": values[4], "az": values[5], "gx": values[6], "gy": values[7],
                 "gz": values[8], "mx": values[9], "my": values[10], "mz": values[11], "temp": values[12],
                 "timestamp_ms": values[13],
-            })
+            }
+            if self.packet_mode == "sync":
+                packet.update({
+                    "sync_id": sync_id,
+                    "sync_trigger_us": sync_trigger_us,
+                    "sync_sample_us": sample_us,
+                    "sync_flags": sync_flags,
+                    "timestamp_ms": sample_us / 1000.0,
+                })
+            self.packet_queue.put(packet)
+
+    def _marker_prefix_len(self):
+        max_len = min(len(self._buffer), len(SYNC_MARKER) - 1)
+        for size in range(max_len, 0, -1):
+            if self._buffer[-size:] == SYNC_MARKER[:size]:
+                return size
+        return 0
+
+    def _consume_text_preamble(self, data):
+        if not data:
+            return
+        self._text_buffer.extend(data)
+        while b'\n' in self._text_buffer:
+            line, _, rest = self._text_buffer.partition(b'\n')
+            self._text_buffer = bytearray(rest)
+            self._handle_text_line(line.decode("ascii", errors="ignore").strip())
+
+    def _handle_text_line(self, line):
+        if not line:
+            return
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == "SYNC_ACK":
+            try:
+                self.ack_queue.put({
+                    "sync_id": int(parts[1]),
+                    "trigger_us": int(parts[2]),
+                    "ack_pc": time.perf_counter(),
+                })
+            except ValueError:
+                pass
 
 
 # ===================== CSV Writers =====================
@@ -360,6 +564,11 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.args = args
         self.theme = THEME_DARK if detect_dark_theme() else THEME_LIGHT
+        self.project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.log_dir = os.path.join(self.project_root, "log")
+        self.calibration_root = os.path.join(self.project_root, CALIBRATION_PROFILE_DIR)
+        os.makedirs(self.log_dir, exist_ok=True)
+        os.makedirs(self.calibration_root, exist_ok=True)
 
         # Time syncing
         self.ts_offset = 0.0
@@ -404,6 +613,24 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.finish_points = [[1, 1], [1, 1], [1, 1], [1, 1], [1, 1], [1, 1], [1, 1], [1, 1], [1, 1]]
 
         self.system_running = False
+        self.sync_running = False
+        self.sync_target_count = 3
+        self.sync_results = []
+        self.sync_output_file = None
+        self.sync_ppg_events = deque()
+        self.sync_left_events = deque()
+        self.sync_right_events = deque()
+        self.sync_next_id = 1
+        self.sync_pending_triggers = {}
+        self.sync_current_trigger = None
+        self.sync_confirmation_pending = False
+        self.sync_ppg_detectors = {
+            "Red": AdaptiveRisingEdgeDetector(history_size=250, min_samples=40),
+            "IR": AdaptiveRisingEdgeDetector(history_size=250, min_samples=40),
+            "Green": AdaptiveRisingEdgeDetector(history_size=250, min_samples=40),
+        }
+        self.sync_left_detector = AdaptiveRisingEdgeDetector(history_size=90, min_samples=12)
+        self.sync_right_detector = AdaptiveRisingEdgeDetector(history_size=90, min_samples=12)
 
         self._build_ui()
         self._connect_signals()
@@ -416,6 +643,10 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.resize(1600, 1000)
         
         t = self.theme
+        mono_font = QFont("Consolas", 12)
+        mono_font.setStyleHint(QFont.TypeWriter)
+        value_width = QtGui.QFontMetrics(mono_font).horizontalAdvance("-0000.00000") + 16
+        sidebar_width = 240
         pg.setConfigOptions(antialias=False, useOpenGL=False, background=t['bg'], foreground=t['fg'])
         central = QtWidgets.QWidget(self)
         self.setCentralWidget(central)
@@ -462,20 +693,46 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         # Global Control
         self.btn_start = QtWidgets.QPushButton("▶ Start All")
         self.btn_start.setStyleSheet(btn_ss)
+        self.btn_start.setFixedWidth(sidebar_width)
         self.btn_stop = QtWidgets.QPushButton("■ Stop All")
         self.btn_stop.setStyleSheet(btn_ss)
         self.btn_stop.setEnabled(False)
+        self.btn_stop.setFixedWidth(sidebar_width)
         sidebar.addWidget(self.btn_start)
         sidebar.addWidget(self.btn_stop)
+
+        # Sync Mode
+        grp_sync = QtWidgets.QGroupBox("Sync Mode")
+        grp_sync.setStyleSheet(group_ss)
+        grp_sync.setFixedWidth(sidebar_width)
+        lo_sync = QtWidgets.QVBoxLayout(grp_sync)
+        self.spin_sync_count = QtWidgets.QSpinBox()
+        self.spin_sync_count.setRange(3, 30)
+        self.spin_sync_count.setValue(3)
+        self.spin_sync_count.setStyleSheet(combo_ss)
+        self.btn_sync_start = QtWidgets.QPushButton("Start Sync")
+        self.btn_sync_start.setStyleSheet(btn_ss)
+        self.btn_sync_stop = QtWidgets.QPushButton("Stop Sync")
+        self.btn_sync_stop.setStyleSheet(btn_ss)
+        self.btn_sync_stop.setEnabled(False)
+        self.lbl_sync_status = QtWidgets.QLabel("Sync: idle")
+        self.lbl_sync_status.setStyleSheet(f"font-size: 12px; color: {t['label_color']};")
+        lo_sync.addWidget(QtWidgets.QLabel("Flash count:"))
+        lo_sync.addWidget(self.spin_sync_count)
+        lo_sync.addWidget(self.btn_sync_start)
+        lo_sync.addWidget(self.btn_sync_stop)
+        lo_sync.addWidget(self.lbl_sync_status)
+        sidebar.addWidget(grp_sync)
         
         # Sensor Settings
         grp_sensor = QtWidgets.QGroupBox("Sensor Settings")
         grp_sensor.setStyleSheet(group_ss)
+        grp_sensor.setFixedWidth(sidebar_width)
         lo_sensor = QtWidgets.QVBoxLayout(grp_sensor)
-        self.combo_port = QtWidgets.QComboBox()
+        self.combo_port = SensorPortComboBox()
         self.combo_port.setStyleSheet(combo_ss)
-        self.combo_port.addItems(["COM1", "COM2", "COM3", "COM4", "COM5", "COM6"])
-        self.combo_port.setCurrentText(self.args.port)
+        self.combo_port.popup_requested.connect(self._populate_sensor_ports)
+        self._populate_sensor_ports()
         self.combo_baud = QtWidgets.QComboBox()
         self.combo_baud.setStyleSheet(combo_ss)
         self.combo_baud.addItems(["9600", "115200", "1000000"])
@@ -487,6 +744,7 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         # Eye tracker Settings
         grp_eye = QtWidgets.QGroupBox("Eye Tracker Setup")
         grp_eye.setStyleSheet(group_ss)
+        grp_eye.setFixedWidth(sidebar_width)
         lo_eye = QtWidgets.QVBoxLayout(grp_eye)
         self.combo_env = QtWidgets.QComboBox()
         self.combo_env.setStyleSheet(combo_ss)
@@ -502,6 +760,7 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         # Calibration
         grp_cal = QtWidgets.QGroupBox("Eye Calibration")
         grp_cal.setStyleSheet(group_ss)
+        grp_cal.setFixedWidth(sidebar_width)
         lo_cal = QtWidgets.QVBoxLayout(grp_cal)
         self.combo_points = QtWidgets.QComboBox()
         self.combo_points.setStyleSheet(combo_ss)
@@ -512,17 +771,48 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.btn_cal_start.setEnabled(False)
         self.btn_cal_stop = QtWidgets.QPushButton("Stop Calibration")
         self.btn_cal_stop.setStyleSheet(btn_ss)
+        self.btn_cal_stop.setEnabled(False)
         lo_cal.addWidget(QtWidgets.QLabel("Points:")); lo_cal.addWidget(self.combo_points)
         lo_cal.addWidget(self.btn_cal_start); lo_cal.addWidget(self.btn_cal_stop)
         sidebar.addWidget(grp_cal)
+
+        grp_profiles = QtWidgets.QGroupBox("Calibration Profile")
+        grp_profiles.setStyleSheet(group_ss)
+        grp_profiles.setFixedWidth(sidebar_width)
+        lo_profiles = QtWidgets.QVBoxLayout(grp_profiles)
+        self.combo_calibration_profile = QtWidgets.QComboBox()
+        self.combo_calibration_profile.setStyleSheet(combo_ss)
+        self.combo_calibration_profile.setEditable(True)
+        self.btn_refresh_profiles = QtWidgets.QPushButton("Refresh Profiles")
+        self.btn_refresh_profiles.setStyleSheet(btn_ss)
+        self.btn_load_profile = QtWidgets.QPushButton("Load Selected")
+        self.btn_load_profile.setStyleSheet(btn_ss)
+        self.btn_save_profile = QtWidgets.QPushButton("Save Current")
+        self.btn_save_profile.setStyleSheet(btn_ss)
+        lo_profiles.addWidget(self.combo_calibration_profile)
+        lo_profiles.addWidget(self.btn_refresh_profiles)
+        lo_profiles.addWidget(self.btn_load_profile)
+        lo_profiles.addWidget(self.btn_save_profile)
+        sidebar.addWidget(grp_profiles)
+        self._refresh_calibration_profiles()
         
         # Realtime Values
         grp_vals = QtWidgets.QGroupBox("Eye Tracker Live Data")
         grp_vals.setStyleSheet(group_ss)
+        grp_vals.setFixedWidth(sidebar_width)
         lo_vals = QtWidgets.QGridLayout(grp_vals)
+        lo_vals.setHorizontalSpacing(6)
+        lo_vals.setVerticalSpacing(4)
+        lo_vals.setColumnMinimumWidth(0, 48)
+        lo_vals.setColumnMinimumWidth(1, value_width)
+        lo_vals.setColumnStretch(1, 1)
         self.lbl_gaze_x, self.lbl_gaze_y = QtWidgets.QLabel(""), QtWidgets.QLabel("")
         self.lbl_pupil_x, self.lbl_pupil_y = QtWidgets.QLabel(""), QtWidgets.QLabel("")
-        for l in (self.lbl_gaze_x, self.lbl_gaze_y, self.lbl_pupil_x, self.lbl_pupil_y): l.setStyleSheet(val_ss)
+        for l in (self.lbl_gaze_x, self.lbl_gaze_y, self.lbl_pupil_x, self.lbl_pupil_y):
+            l.setStyleSheet(val_ss)
+            l.setFont(mono_font)
+            l.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            l.setFixedWidth(value_width)
         lo_vals.addWidget(QtWidgets.QLabel("Gaze X"), 0, 0); lo_vals.addWidget(self.lbl_gaze_x, 0, 1)
         lo_vals.addWidget(QtWidgets.QLabel("Gaze Y"), 1, 0); lo_vals.addWidget(self.lbl_gaze_y, 1, 1)
         lo_vals.addWidget(QtWidgets.QLabel("Pupil L"), 2, 0); lo_vals.addWidget(self.lbl_pupil_x, 2, 1)
@@ -542,17 +832,21 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.labelSceneImage.connect_customized_slot(self._on_scene_clicked)
         self.labelSceneImage.setStyleSheet(f"QLabel {{ background: {t['value_bg']}; border: 1px solid {t['group_border']}; border-radius: 6px; }}")
         self.labelSceneImage.setAlignment(Qt.AlignCenter)
+        self.labelSceneImage.setText("Scene Image")
         self.labelSceneImage.setMinimumSize(640, 360)
-        self.labelSceneImage.setScaledContents(True)
         scene_eye_row.addWidget(self.labelSceneImage, stretch=3)
         
         eyes_col = QtWidgets.QVBoxLayout()
-        self.labelLeftEye = QtWidgets.QLabel()
-        self.labelLeftEye.setFixedSize(200, 150)
+        self.labelLeftEye = AspectRatioPixmapLabel()
+        self.labelLeftEye.setText("left eye")
+        self.labelLeftEye.setMinimumSize(200, 150)
+        self.labelLeftEye.setMaximumWidth(220)
         self.labelLeftEye.setStyleSheet(f"background:{t['value_bg']}; border: 1px solid {t['group_border']}; border-radius: 4px;")
         self.labelLeftEye.setAlignment(Qt.AlignCenter)
-        self.labelRightEye = QtWidgets.QLabel()
-        self.labelRightEye.setFixedSize(200, 150)
+        self.labelRightEye = AspectRatioPixmapLabel()
+        self.labelRightEye.setText("right eye")
+        self.labelRightEye.setMinimumSize(200, 150)
+        self.labelRightEye.setMaximumWidth(220)
         self.labelRightEye.setStyleSheet(f"background:{t['value_bg']}; border: 1px solid {t['group_border']}; border-radius: 4px;")
         self.labelRightEye.setAlignment(Qt.AlignCenter)
         
@@ -564,12 +858,11 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         eyes_col.addStretch()
         scene_eye_row.addLayout(eyes_col, stretch=1)
         
-        content_layout.addLayout(scene_eye_row, stretch=2)
+        content_layout.addLayout(scene_eye_row, stretch=3)
 
-        # -- Bottom Content: Plots Grid --
-        lo_plots = QtWidgets.QGridLayout()
-        lo_plots.setHorizontalSpacing(8)
-        lo_plots.setVerticalSpacing(8)
+        # -- Bottom Content: Plot Columns --
+        plots_row = QtWidgets.QHBoxLayout()
+        plots_row.setSpacing(8)
         
         # PPG Widget
         self.ppg_widget = pg.GraphicsLayoutWidget()
@@ -581,9 +874,12 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         # Link PPG axes together to align them natively inside the GraphicsLayout
         self.ppg_ir_plot.setXLink(self.ppg_red_plot)
         self.ppg_green_plot.setXLink(self.ppg_red_plot)
-        self.ppg_red_plot.hideAxis('bottom')
-        self.ppg_ir_plot.hideAxis('bottom')
+        self.ppg_red_plot.getAxis('bottom').setStyle(showValues=False)
+        self.ppg_ir_plot.getAxis('bottom').setStyle(showValues=False)
         self.ppg_green_plot.setLabel("bottom", "Time", units="s")
+        self.ppg_widget.ci.layout.setRowStretchFactor(0, 1)
+        self.ppg_widget.ci.layout.setRowStretchFactor(1, 1)
+        self.ppg_widget.ci.layout.setRowStretchFactor(2, 1)
 
         self.ppg_curves = []
         for plt_ref, col in [(self.ppg_red_plot, "#FF6B6B"), (self.ppg_ir_plot, "#2EC4B6"), (self.ppg_green_plot, "#90BE6D")]:
@@ -614,14 +910,22 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.pupil_l_curve = self.pupil_plot_widget.plot(pen=pg.mkPen("#9AD1FF", width=2), name="Left")
         self.pupil_r_curve = self.pupil_plot_widget.plot(pen=pg.mkPen("#FFD166", width=2), name="Right")
 
-        lo_plots.addWidget(self.ppg_widget, 0, 0)
-        lo_plots.addWidget(self.accel_plot[0], 0, 1)
-        lo_plots.addWidget(self.gyro_plot[0], 0, 2)
-        lo_plots.addWidget(self.mag_plot[0], 1, 0)
-        lo_plots.addWidget(self.gaze_plot_widget, 1, 1)
-        lo_plots.addWidget(self.pupil_plot_widget, 1, 2)
+        imu_column = QtWidgets.QVBoxLayout()
+        imu_column.setSpacing(8)
+        imu_column.addWidget(self.accel_plot[0])
+        imu_column.addWidget(self.gyro_plot[0])
+        imu_column.addWidget(self.mag_plot[0])
 
-        content_layout.addLayout(lo_plots, stretch=1)
+        eye_wave_column = QtWidgets.QVBoxLayout()
+        eye_wave_column.setSpacing(8)
+        eye_wave_column.addWidget(self.gaze_plot_widget)
+        eye_wave_column.addWidget(self.pupil_plot_widget)
+
+        plots_row.addWidget(self.ppg_widget, stretch=2)
+        plots_row.addLayout(imu_column, stretch=1)
+        plots_row.addLayout(eye_wave_column, stretch=1)
+
+        content_layout.addLayout(plots_row, stretch=2)
 
     def _create_pg_plot(self, title, ylabel, colors, legend, xlink_target=None):
         w = pg.PlotWidget()
@@ -639,11 +943,494 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         curves = [item.plot(pen=pg.mkPen(color=col, width=1.5), name=name) for col, name in zip(colors, legend)]
         return w, curves
 
+    def _populate_sensor_ports(self):
+        current_port = self.combo_port.currentData() or self.args.port
+        self.combo_port.clear()
+        matched_ports = [
+            port for port in list_ports.comports()
+            if self._is_target_sensor_port(port)
+        ]
+        matched_ports.sort(key=lambda port: port.device)
+
+        for port in matched_ports:
+            self.combo_port.addItem(f"{port.device} - {port.description}", port.device)
+
+        preferred_index = self.combo_port.findData(current_port)
+        if preferred_index >= 0:
+            self.combo_port.setCurrentIndex(preferred_index)
+        elif self.combo_port.count() > 0:
+            self.combo_port.setCurrentIndex(0)
+
+    def _is_target_sensor_port(self, port):
+        target = TARGET_SERIAL_DESCRIPTION.casefold()
+        fields = (
+            port.description,
+            port.manufacturer,
+            port.product,
+            port.interface,
+        )
+        return any(target in (field or "").casefold() for field in fields)
+
+    def _sanitize_profile_name(self, value):
+        cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_", " ") else "_" for ch in value).strip()
+        return cleaned or datetime.now().strftime("profile_%Y%m%d_%H%M%S")
+
+    def _profile_dir_from_name(self, profile_name):
+        return os.path.join(self.calibration_root, profile_name)
+
+    def _refresh_calibration_profiles(self):
+        current_text = self.combo_calibration_profile.currentText() if hasattr(self, "combo_calibration_profile") else ""
+        profile_names = []
+        if os.path.isdir(self.calibration_root):
+            for name in sorted(os.listdir(self.calibration_root)):
+                profile_dir = self._profile_dir_from_name(name)
+                if os.path.isdir(profile_dir):
+                    left_path = os.path.join(profile_dir, "left_coe.dat")
+                    right_path = os.path.join(profile_dir, "right_coe.dat")
+                    if os.path.isfile(left_path) and os.path.isfile(right_path):
+                        profile_names.append(name)
+
+        self.combo_calibration_profile.blockSignals(True)
+        self.combo_calibration_profile.clear()
+        self.combo_calibration_profile.addItems(profile_names)
+        if current_text:
+            self.combo_calibration_profile.setCurrentText(current_text)
+        elif profile_names:
+            self.combo_calibration_profile.setCurrentIndex(0)
+        self.combo_calibration_profile.blockSignals(False)
+        self._update_calibration_profile_controls()
+
+    def _update_calibration_profile_controls(self):
+        profile_name = self.combo_calibration_profile.currentText().strip()
+        has_profile = False
+        if profile_name:
+            profile_dir = self._profile_dir_from_name(profile_name)
+            has_profile = (
+                os.path.isfile(os.path.join(profile_dir, "left_coe.dat"))
+                and os.path.isfile(os.path.join(profile_dir, "right_coe.dat"))
+            )
+        self.btn_load_profile.setEnabled(self.eye_sdk_running and has_profile)
+        self.btn_save_profile.setEnabled(self.eye_sdk_running)
+
+    def _load_selected_calibration_profile(self, show_message=True):
+        profile_name = self.combo_calibration_profile.currentText().strip()
+        if not profile_name:
+            if show_message:
+                QtWidgets.QMessageBox.warning(self, "Warning", "Please select a calibration profile.")
+            return False
+
+        profile_dir = self._profile_dir_from_name(profile_name)
+        try:
+            self.eye_sdk.load_calibration_profile(profile_dir)
+        except Exception as exc:
+            if show_message:
+                QtWidgets.QMessageBox.warning(self, "Warning", f"Failed to load calibration profile '{profile_name}': {exc}")
+            return False
+        return True
+
+    def _save_current_calibration_profile(self):
+        if not self.eye_sdk_running:
+            QtWidgets.QMessageBox.warning(self, "Warning", "Start the eye tracker before saving calibration data.")
+            return
+
+        profile_name = self._sanitize_profile_name(self.combo_calibration_profile.currentText())
+        profile_dir = self._profile_dir_from_name(profile_name)
+        try:
+            self.eye_sdk.save_calibration_profile(profile_dir)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Warning", f"Failed to save calibration profile '{profile_name}': {exc}")
+            return
+
+        self.combo_calibration_profile.setCurrentText(profile_name)
+        self._refresh_calibration_profiles()
+
+    def _load_profile_from_button(self):
+        if not self.eye_sdk_running:
+            QtWidgets.QMessageBox.warning(self, "Warning", "Start the eye tracker before loading calibration data.")
+            return
+        self._load_selected_calibration_profile(show_message=True)
+
+    def _reset_sync_state(self):
+        self.sync_results = []
+        self.sync_output_file = None
+        self.sync_ppg_events.clear()
+        self.sync_left_events.clear()
+        self.sync_right_events.clear()
+        self.sync_next_id = 1
+        self.sync_pending_triggers.clear()
+        self.sync_current_trigger = None
+        self.sync_confirmation_pending = False
+        for detector in self.sync_ppg_detectors.values():
+            detector.reset()
+        self.sync_left_detector.reset()
+        self.sync_right_detector.reset()
+
+    def _set_sync_controls_running(self, running):
+        self.btn_sync_start.setEnabled(not running and not self.system_running)
+        self.btn_sync_stop.setEnabled(running)
+        self.spin_sync_count.setEnabled(not running)
+        self.btn_start.setEnabled(not running and not self.system_running)
+        self.btn_stop.setEnabled(self.system_running)
+
+    def _on_start_sync(self):
+        if self.system_running:
+            QtWidgets.QMessageBox.warning(self, "Warning", "Stop normal logging before starting sync mode.")
+            return
+        if self.sync_running:
+            return
+
+        self._populate_sensor_ports()
+        selected_port = self.combo_port.currentData()
+        if not selected_port:
+            QtWidgets.QMessageBox.warning(self, "Warning", f"No '{TARGET_SERIAL_DESCRIPTION}' serial port found.")
+            return
+
+        self.sync_target_count = int(self.spin_sync_count.value())
+        self._reset_sync_state()
+        self.sync_output_file = os.path.join(
+            self.log_dir,
+            f"sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        )
+        self.lbl_sync_status.setText(f"Sync: 0/{self.sync_target_count}")
+
+        self.sensor_reader = SerialPacketReader(selected_port, int(self.combo_baud.currentText()), packet_mode="sync")
+        if not self.sensor_reader.open():
+            self.sensor_reader = None
+            QtWidgets.QMessageBox.warning(self, "Warning", "Sensor failed to connect.")
+            return
+
+        time.sleep(SERIAL_STARTUP_SETTLE_SECONDS)
+        self.sensor_reader.serial_port.reset_input_buffer()
+        self.sensor_reader.serial_port.reset_output_buffer()
+        if not self.sensor_reader.start():
+            self.sensor_reader.stop()
+            self.sensor_reader = None
+            QtWidgets.QMessageBox.warning(self, "Warning", "Sensor reader thread failed to start.")
+            return
+
+        pwd = self._read_pwd()
+        if self.eye_sdk.connect_softdog(pwd) != 0:
+            self._stop_sync_devices()
+            QtWidgets.QMessageBox.warning(self, "Warning", "Eye tracker dog connect failed.")
+            return
+
+        env = self.combo_env.currentData()
+        res = self.combo_res.currentData()
+        self.scene_width, self.scene_height = (1280, 960) if res == 201 else (1280, 720) if res == 202 else (800, 600) if res == 203 else (1920, 1080)
+        if self.eye_sdk.start(env, res, self.scene_width, self.scene_height) != 0:
+            self._stop_sync_devices()
+            QtWidgets.QMessageBox.warning(self, "Warning", "Eye tracker start failed.")
+            return
+
+        self._on_set_sdk_running(True)
+        self._load_selected_calibration_profile(show_message=False)
+        self.sync_running = True
+        self._set_sync_controls_running(True)
+        self.lbl_sync_status.setText("Sync: settling camera baseline")
+        self.timer.start(PLOT_UPDATE_INTERVAL_MS)
+        QtCore.QTimer.singleShot(1000, self._send_next_sync_trigger)
+
+    def _on_stop_sync(self):
+        if not self.sync_running:
+            return
+        self.sync_running = False
+        self.timer.stop()
+        self._stop_sync_devices()
+        self._save_sync_results()
+        self._set_sync_controls_running(False)
+        self._update_sync_status(final=True)
+
+    def _stop_sync_devices(self):
+        if self.sensor_reader:
+            try:
+                self.sensor_reader.send_command("e\n")
+                time.sleep(0.3)
+            except Exception:
+                pass
+            self.sensor_reader.stop()
+            self.sensor_reader = None
+
+        if self.eye_sdk_running:
+            if self.calibration_is_running:
+                self._on_stop_calibration()
+            self.eye_sdk.stop()
+            self._on_set_sdk_running(False)
+
+    def _send_next_sync_trigger(self):
+        if not self.sync_running or self.sync_confirmation_pending:
+            return
+        if len(self.sync_results) >= self.sync_target_count:
+            return
+        if not self.sensor_reader:
+            return
+
+        sync_id = self.sync_next_id
+        send_pc = self.sensor_reader.send_sync_start(sync_id)
+        if send_pc is None:
+            QtWidgets.QMessageBox.warning(self, "Warning", "Failed to send SYNC_START to sensor.")
+            self._on_stop_sync()
+            return
+
+        self.sync_pending_triggers[sync_id] = {"sync_id": sync_id, "send_pc": send_pc}
+        self.sync_next_id += 1
+        self.lbl_sync_status.setText(
+            f"Sync: {len(self.sync_results)}/{self.sync_target_count}, trigger {sync_id} sent"
+        )
+
+    def _process_sync_acks(self):
+        if not self.sensor_reader:
+            return
+        while True:
+            try:
+                ack = self.sensor_reader.ack_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            pending = self.sync_pending_triggers.pop(ack["sync_id"], None)
+            if pending is None:
+                continue
+            send_pc = pending["send_pc"]
+            trigger_pc = (send_pc + ack["ack_pc"]) / 2.0
+            self.sync_current_trigger = {
+                "sync_id": ack["sync_id"],
+                "send_pc": send_pc,
+                "ack_pc": ack["ack_pc"],
+                "trigger_pc": trigger_pc,
+                "trigger_us": ack["trigger_us"],
+                "first_left_frame_pc": None,
+                "first_right_frame_pc": None,
+                "eye_event": None,
+            }
+
+    def _check_sync_trigger_timeout(self):
+        if self.sync_confirmation_pending or self.sync_current_trigger:
+            return
+        now = time.perf_counter()
+        expired = [
+            sync_id for sync_id, trigger in self.sync_pending_triggers.items()
+            if now - trigger["send_pc"] > SYNC_EVENT_RETENTION_SECONDS
+        ]
+        for sync_id in expired:
+            self.sync_pending_triggers.pop(sync_id, None)
+            self.lbl_sync_status.setText(
+                f"Sync: {len(self.sync_results)}/{self.sync_target_count}, trigger {sync_id} no ACK"
+            )
+            QtCore.QTimer.singleShot(500, self._send_next_sync_trigger)
+            break
+
+    def _pixmap_mean_brightness(self, pixmap):
+        image = pixmap.toImage().convertToFormat(QtGui.QImage.Format_Grayscale8)
+        width = image.width()
+        height = image.height()
+        if width <= 0 or height <= 0:
+            return None
+        ptr = image.bits()
+        ptr.setsize(image.byteCount())
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape((height, image.bytesPerLine()))
+        return float(arr[:, :width].mean())
+
+    def _process_sync_eye_sample(self, eye_name, timestamp, image):
+        brightness = self._pixmap_mean_brightness(image)
+        if brightness is None:
+            return
+        if self.sync_current_trigger and timestamp >= self.sync_current_trigger["send_pc"]:
+            frame_key = f"first_{eye_name}_frame_pc"
+            if self.sync_current_trigger.get(frame_key) is None:
+                self.sync_current_trigger[frame_key] = timestamp
+        if eye_name == "left":
+            event = self.sync_left_detector.push(timestamp, brightness)
+            if event:
+                event["source"] = "left eye"
+                if self.sync_current_trigger and timestamp >= self.sync_current_trigger["send_pc"]:
+                    event["sync_id"] = self.sync_current_trigger["sync_id"]
+                    self.sync_left_events.append(event)
+        else:
+            event = self.sync_right_detector.push(timestamp, brightness)
+            if event:
+                event["source"] = "right eye"
+                if self.sync_current_trigger and timestamp >= self.sync_current_trigger["send_pc"]:
+                    event["sync_id"] = self.sync_current_trigger["sync_id"]
+                    self.sync_right_events.append(event)
+        self._try_confirm_sync_event(timestamp)
+
+    def _process_sync_ppg_sample(self, sample):
+        if not self.sync_current_trigger:
+            return
+        if sample.get("sync_id") != self.sync_current_trigger["sync_id"]:
+            return
+        self.sync_current_trigger["last_ppg_sample_us"] = sample.get("sync_sample_us")
+
+    def _try_confirm_sync_event(self, now):
+        if self.sync_confirmation_pending or not self.sync_running:
+            return
+        if not self.sync_current_trigger:
+            return
+        sync_id = self.sync_current_trigger["sync_id"]
+        eye_events = [
+            event for event in list(self.sync_left_events) + list(self.sync_right_events)
+            if event.get("sync_id") == sync_id
+        ]
+        if not eye_events:
+            if now - self.sync_current_trigger["send_pc"] > SYNC_EVENT_RETENTION_SECONDS:
+                self.lbl_sync_status.setText(
+                    f"Sync: {len(self.sync_results)}/{self.sync_target_count}, trigger {sync_id} timed out"
+                )
+                self.sync_current_trigger = None
+                QtCore.QTimer.singleShot(500, self._send_next_sync_trigger)
+            return
+        eye_event = max(eye_events, key=lambda item: item["slope_score"])
+        if eye_event["time"] - self.sync_current_trigger["send_pc"] > SYNC_EVENT_RETENTION_SECONDS:
+            self.lbl_sync_status.setText(
+                f"Sync: {len(self.sync_results)}/{self.sync_target_count}, trigger {sync_id} timed out"
+            )
+            self.sync_current_trigger = None
+            QtCore.QTimer.singleShot(500, self._send_next_sync_trigger)
+            return
+
+        self._discard_sync_events_for_id(sync_id)
+        self.sync_confirmation_pending = True
+
+        trigger_pc = self.sync_current_trigger["trigger_pc"]
+        diff_ms = (trigger_pc - eye_event["time"]) * 1000.0
+        first_left = self.sync_current_trigger.get("first_left_frame_pc")
+        first_right = self.sync_current_trigger.get("first_right_frame_pc")
+        message = (
+            f"Detected flash candidate #{len(self.sync_results) + 1}/{self.sync_target_count}.\n\n"
+            f"SYNC_START id: {sync_id}\n"
+            f"Arduino trigger micros: {self.sync_current_trigger['trigger_us']}\n"
+            f"Camera edge: {eye_event['source']} score {eye_event['slope_score']:.1f}\n"
+            f"First left frame after trigger: {self._format_relative_ms(first_left, trigger_pc)}\n"
+            f"First right frame after trigger: {self._format_relative_ms(first_right, trigger_pc)}\n"
+            f"Sensor trigger - camera edge: {diff_ms:.2f} ms\n\n"
+            "Approve this sync point?"
+        )
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Confirm Sync Flash",
+            message,
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.Yes,
+        )
+
+        if reply == QtWidgets.QMessageBox.Yes:
+            self.sync_results.append({
+                "sync_id": sync_id,
+                "trigger_us": self.sync_current_trigger["trigger_us"],
+                "trigger_pc": trigger_pc,
+                "eye_source": eye_event["source"],
+                "eye_time": eye_event["time"],
+                "diff_ms": diff_ms,
+                "first_left_frame_delta_ms": None if first_left is None else (first_left - trigger_pc) * 1000.0,
+                "first_right_frame_delta_ms": None if first_right is None else (first_right - trigger_pc) * 1000.0,
+            })
+            self._update_sync_status()
+            if len(self.sync_results) >= self.sync_target_count:
+                avg_ms = self._sync_average_ms()
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Sync Complete",
+                    f"Sync complete.\nAverage PPG - eye timestamp difference: {avg_ms:.2f} ms",
+                )
+                self._on_stop_sync()
+            else:
+                self.sync_current_trigger = None
+                QtCore.QTimer.singleShot(500, self._send_next_sync_trigger)
+        else:
+            self._update_sync_status(rejected=True)
+            self.sync_current_trigger = None
+            QtCore.QTimer.singleShot(500, self._send_next_sync_trigger)
+
+        self.sync_confirmation_pending = False
+
+    def _update_sync_status(self, final=False, rejected=False):
+        count = len(self.sync_results)
+        if count:
+            avg_ms = self._sync_average_ms()
+            suffix = f", avg {avg_ms:.2f} ms"
+        else:
+            suffix = ""
+        if final:
+            prefix = "Sync: stopped"
+        elif rejected:
+            prefix = f"Sync: {count}/{self.sync_target_count}, rejected"
+        else:
+            prefix = f"Sync: {count}/{self.sync_target_count}"
+        self.lbl_sync_status.setText(prefix + suffix)
+
+    def _save_sync_results(self):
+        if not self.sync_output_file or not self.sync_results:
+            return
+        avg_ms = self._sync_average_ms()
+        with open(self.sync_output_file, "w", newline="") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow([
+                "index",
+                "sync_id",
+                "arduino_trigger_us",
+                "sensor_trigger_minus_camera_edge_ms",
+                "camera_source",
+                "first_left_frame_delta_ms",
+                "first_right_frame_delta_ms",
+            ])
+            for index, result in enumerate(self.sync_results, start=1):
+                writer.writerow([
+                    index,
+                    result["sync_id"],
+                    result["trigger_us"],
+                    f"{result['diff_ms']:.6f}",
+                    result["eye_source"],
+                    self._format_optional_float(result["first_left_frame_delta_ms"]),
+                    self._format_optional_float(result["first_right_frame_delta_ms"]),
+                ])
+            writer.writerow(["average", f"{avg_ms:.6f}"])
+
+    def _sync_average_ms(self):
+        return float(np.mean([result["diff_ms"] for result in self.sync_results]))
+
+    @staticmethod
+    def _format_relative_ms(timestamp, reference):
+        if timestamp is None:
+            return "--"
+        return f"{(timestamp - reference) * 1000.0:.2f} ms"
+
+    @staticmethod
+    def _format_optional_float(value):
+        return "" if value is None else f"{value:.6f}"
+
+    def _trim_sync_events(self, now):
+        cutoff = now - SYNC_EVENT_RETENTION_SECONDS
+        for events in (self.sync_ppg_events, self.sync_left_events, self.sync_right_events):
+            while events and events[0]["time"] < cutoff:
+                events.popleft()
+
+    @staticmethod
+    def _nearest_event(events, target_time):
+        if not events:
+            return None
+        return min(events, key=lambda item: abs(item["time"] - target_time))
+
+    @staticmethod
+    def _discard_sync_event(events, target_event):
+        try:
+            events.remove(target_event)
+        except ValueError:
+            pass
+
+    def _discard_sync_events_for_id(self, sync_id):
+        self.sync_left_events = deque(event for event in self.sync_left_events if event.get("sync_id") != sync_id)
+        self.sync_right_events = deque(event for event in self.sync_right_events if event.get("sync_id") != sync_id)
+
     def _connect_signals(self):
         self.btn_start.clicked.connect(self._on_start_all)
         self.btn_stop.clicked.connect(self._on_stop_all)
+        self.btn_sync_start.clicked.connect(self._on_start_sync)
+        self.btn_sync_stop.clicked.connect(self._on_stop_sync)
         self.btn_cal_start.clicked.connect(self._on_start_calibration)
         self.btn_cal_stop.clicked.connect(self._on_stop_calibration)
+        self.btn_refresh_profiles.clicked.connect(self._refresh_calibration_profiles)
+        self.btn_load_profile.clicked.connect(self._load_profile_from_button)
+        self.btn_save_profile.clicked.connect(self._save_current_calibration_profile)
+        self.combo_calibration_profile.editTextChanged.connect(self._update_calibration_profile_controls)
 
         self.set_sdk_running_signal.connect(self._on_set_sdk_running)
         self.set_pupil_center_signal.connect(self._display_pupil_data)
@@ -663,25 +1450,42 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         painter.drawEllipse(rect)
         self.labelSceneImage.setPixmap(image)
     
-    def _display_left_eye_image(self, image): self.labelLeftEye.setPixmap(image)
-    def _display_right_eye_image(self, image): self.labelRightEye.setPixmap(image)
+    def _display_left_eye_image(self, image):
+        self.labelLeftEye.setPixmap(image)
+        if self.sync_running:
+            self._process_sync_eye_sample("left", time.perf_counter(), image)
+
+    def _display_right_eye_image(self, image):
+        self.labelRightEye.setPixmap(image)
+        if self.sync_running:
+            self._process_sync_eye_sample("right", time.perf_counter(), image)
 
     def _display_pupil_data(self, lx, ly, rx, ry):
-        self.lbl_pupil_x.setText(str(lx)); self.lbl_pupil_y.setText(str(ly))
+        self.lbl_pupil_x.setText(f"{lx:.5f}"); self.lbl_pupil_y.setText(f"{rx:.5f}")
 
     def _display_gaze_data(self, x, y):
-        self.lbl_gaze_x.setText(str(x)); self.lbl_gaze_y.setText(str(y))
+        self.lbl_gaze_x.setText(f"{x:.5f}"); self.lbl_gaze_y.setText(f"{y:.5f}")
         self.cur_gaze_x = x + self.scene_width / 2
         self.cur_gaze_y = y + self.scene_height / 2
 
     def _on_set_sdk_running(self, enabled):
         self.eye_sdk_running = enabled
+        self.btn_cal_start.setEnabled(enabled and not self.calibration_is_running)
+        self.btn_cal_stop.setEnabled(enabled and self.calibration_is_running)
+        self._update_calibration_profile_controls()
         if not enabled:
+            self.calibration_is_running = False
             self.labelSceneImage.setPixmap(QPixmap())
             self.labelLeftEye.setPixmap(QPixmap())
             self.labelRightEye.setPixmap(QPixmap())
 
     def _on_set_calibration_finish(self, eye, index, error):
+        if not self.calibration_is_running:
+            return
+        if index < 1 or index > len(self.finish_points):
+            return
+        if eye < 0 or eye >= len(self.finish_points[index - 1]):
+            return
         self.finish_points[index - 1][eye] = error
         n = self.current_points
         if n == 1:
@@ -700,22 +1504,29 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
                 self._on_stop_calibration()
 
     def _on_scene_clicked(self, norm_x, norm_y):
-        if not self.eye_sdk_running: return
+        if not self.eye_sdk_running or not self.calibration_is_running:
+            return
         px = norm_x * self.scene_width - (self.scene_width / 2)
         py = norm_y * self.scene_height - (self.scene_height / 2)
         self.eye_sdk.set_current_point(px, py)
 
     def _on_start_calibration(self):
+        if not self.eye_sdk_running or self.calibration_is_running:
+            return
         self.current_points = int(self.combo_points.currentText())
         for i in range(len(self.finish_points)): self.finish_points[i] = [1, 1]
         self.calibration_is_running = True
         self.eye_sdk.start_calibration(self.current_points)
         self.btn_cal_start.setEnabled(False)
+        self.btn_cal_stop.setEnabled(True)
 
     def _on_stop_calibration(self):
+        if not self.calibration_is_running:
+            return
         self.eye_sdk.stop_calibration()
         self.calibration_is_running = False
-        self.btn_cal_start.setEnabled(True)
+        self.btn_cal_start.setEnabled(self.eye_sdk_running)
+        self.btn_cal_stop.setEnabled(False)
 
     # ---- Actions ----
     def _read_pwd(self):
@@ -724,25 +1535,43 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         return cf.get("softdog", "pwd", fallback="").encode("utf-8")
 
     def _on_start_all(self):
+        if self.sync_running:
+            QtWidgets.QMessageBox.warning(self, "Warning", "Stop sync mode before starting normal logging.")
+            return
         self.system_running = True
         self.btn_start.setEnabled(False)
+        self._set_sync_controls_running(False)
+        self._populate_sensor_ports()
+        self.sensor_reader = None
+        self.eye_sdk_running = False
         
         # Prepare Logging Dirs
-        log_dir = os.path.join(os.path.dirname(os.getcwd()), "log")
-        os.makedirs(log_dir, exist_ok=True)
         ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         # Start Sensor
-        self.sensor_reader = SerialPacketReader(self.combo_port.currentText(), int(self.combo_baud.currentText()))
-        if self.sensor_reader.start():
-            # TS offset logic requires reader serial to be opened
+        selected_port = self.combo_port.currentData()
+        if not selected_port:
+            QtWidgets.QMessageBox.warning(self, "Warning", f"No '{TARGET_SERIAL_DESCRIPTION}' serial port found.")
+        else:
+            self.sensor_reader = SerialPacketReader(selected_port, int(self.combo_baud.currentText()))
+        if self.sensor_reader and self.sensor_reader.open():
             time.sleep(SERIAL_STARTUP_SETTLE_SECONDS)
             self.sensor_reader.serial_port.reset_input_buffer()
-            self.ts_offset = sync_timestamps(self.sensor_reader.serial_port)
-            self.sensor_csv_writer = SensorCSVWriterThread(os.path.join(log_dir, f"sensor_{ts_str}.csv"))
+            self.sensor_reader.serial_port.reset_output_buffer()
+            self.ts_offset = sync_timestamps(self.sensor_reader.serial_port, rounds=20)
+            self.sensor_csv_writer = SensorCSVWriterThread(os.path.join(self.log_dir, f"sensor_{ts_str}.csv"))
             self.sensor_csv_writer.start()
-            self.sensor_reader.send_command("s\n")
-        else: QtWidgets.QMessageBox.warning(self, "Warning", "Sensor failed to connect.")
+            if self.sensor_reader.start():
+                time.sleep(0.3)
+                self.sensor_reader.send_command("s\n")
+            else:
+                self.sensor_csv_writer.stop()
+                self.sensor_csv_writer = None
+                self.sensor_reader.stop()
+                self.sensor_reader = None
+                QtWidgets.QMessageBox.warning(self, "Warning", "Sensor reader thread failed to start.")
+        elif selected_port:
+            QtWidgets.QMessageBox.warning(self, "Warning", "Sensor failed to connect.")
 
         # Start Eye Tracker
         pwd = self._read_pwd()
@@ -752,11 +1581,16 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
             self.scene_width, self.scene_height = (1280, 960) if res == 201 else (1280, 720) if res == 202 else (800, 600) if res == 203 else (1920, 1080)
             
             if self.eye_sdk.start(env, res, self.scene_width, self.scene_height) == 0:
-                self.eye_csv_writer = EyeCSVWriterThread(os.path.join(log_dir, f"eye_{ts_str}.csv"))
+                self._on_set_sdk_running(True)
+                self._load_selected_calibration_profile(show_message=False)
+                self.eye_csv_writer = EyeCSVWriterThread(os.path.join(self.log_dir, f"eye_{ts_str}.csv"))
                 self.eye_csv_writer.start()
-                self.btn_cal_start.setEnabled(True)
-            else: QtWidgets.QMessageBox.warning(self, "Warning", "Eye tracker start failed.")
-        else: QtWidgets.QMessageBox.warning(self, "Warning", "Eye tracker dog connect failed.")
+            else:
+                self._on_set_sdk_running(False)
+                QtWidgets.QMessageBox.warning(self, "Warning", "Eye tracker start failed.")
+        else:
+            self._on_set_sdk_running(False)
+            QtWidgets.QMessageBox.warning(self, "Warning", "Eye tracker dog connect failed.")
 
         self.btn_stop.setEnabled(True)
         self.timer.start(PLOT_UPDATE_INTERVAL_MS)
@@ -766,19 +1600,30 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.timer.stop()
         self.btn_stop.setEnabled(False)
         self.btn_start.setEnabled(True)
+        self._set_sync_controls_running(False)
         self.btn_cal_start.setEnabled(False)
+        self.btn_cal_stop.setEnabled(False)
+        self._update_calibration_profile_controls()
 
         # Stop Sensor
         if self.sensor_reader:
-            try: self.sensor_reader.send_command("e\n")
-            except: pass
+            try:
+                self.sensor_reader.send_command("e\n")
+                time.sleep(0.3)
+            except Exception:
+                pass
             self.sensor_reader.stop()
-        if self.sensor_csv_writer: self.sensor_csv_writer.stop()
+            self.sensor_reader = None
+        if self.sensor_csv_writer:
+            self.sensor_csv_writer.stop()
+            self.sensor_csv_writer = None
         
         # Stop Eye
         if self.calibration_is_running: self._on_stop_calibration()
         self.eye_sdk.stop()
         if self.eye_csv_writer: self.eye_csv_writer.stop()
+        self.eye_sdk_running = False
+        self.eye_csv_writer = None
         
         print("\n===== Logging Session Summary =====")
         print(f"Sensor Total Packets:    {self.sensor_rate_tracker.total_packets}")
@@ -792,6 +1637,9 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
     # ---- Timer Update ----
     def _on_timer(self):
         now_ms = time.perf_counter() * 1000
+        if self.sync_running:
+            self._process_sync_acks()
+            self._check_sync_trigger_timeout()
 
         # Drain Sensor
         if self.sensor_reader:
@@ -806,6 +1654,8 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
                 gx_b.append(p["gx"]); gy_b.append(p["gy"]); gz_b.append(p["gz"])
                 mx_b.append(p["mx"]); my_b.append(p["my"]); mz_b.append(p["mz"])
                 self.sensor_latest_temp = p["temp"]
+                if self.sync_running:
+                    self._process_sync_ppg_sample(p)
                 
                 if self.sensor_csv_writer:
                     pc_ts = p["timestamp_ms"]/1000.0 + self.ts_offset
@@ -901,6 +1751,7 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event):
         if self.system_running: self._on_stop_all()
+        if self.sync_running: self._on_stop_sync()
         super().closeEvent(event)
 
 

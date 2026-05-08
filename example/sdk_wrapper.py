@@ -206,6 +206,48 @@ class wrapper:
         except Exception as e:
             print("[WARN] Failed to load base coefficients: %s" % e)
 
+    def _read_active_coefficients(self):
+        left_coe = py_7i_coefficient_t()
+        right_coe = py_7i_coefficient_t()
+        left_buf_len = c_int(1024)
+        right_buf_len = c_int(1024)
+        ret_left = self.sdk_dll_handle._7i_get_data(b'biLeft', len(b'biLeft'), left_coe.buf, byref(left_buf_len))
+        ret_right = self.sdk_dll_handle._7i_get_data(b'biRight', len(b'biRight'), right_coe.buf, byref(right_buf_len))
+        if ret_left != 0 or ret_right != 0:
+            raise RuntimeError("failed to read active calibration coefficients: L=%d R=%d" % (ret_left, ret_right))
+        return bytes(left_coe.buf), bytes(right_coe.buf)
+
+    def save_calibration_profile(self, profile_dir):
+        os.makedirs(profile_dir, exist_ok=True)
+        left_data, right_data = self._read_active_coefficients()
+        with open(os.path.join(profile_dir, 'left_coe.dat'), 'wb') as fp:
+            fp.write(left_data)
+        with open(os.path.join(profile_dir, 'right_coe.dat'), 'wb') as fp:
+            fp.write(right_data)
+
+    def load_calibration_profile(self, profile_dir):
+        left_path = os.path.join(profile_dir, 'left_coe.dat')
+        right_path = os.path.join(profile_dir, 'right_coe.dat')
+        if not os.path.isfile(left_path) or not os.path.isfile(right_path):
+            raise FileNotFoundError("calibration profile files are missing")
+
+        local_left_coe = py_7i_coefficient_t()
+        with open(left_path, 'rb') as fp:
+            left_data = fp.read(1024)
+            memmove(local_left_coe.buf, left_data, len(left_data))
+
+        local_right_coe = py_7i_coefficient_t()
+        with open(right_path, 'rb') as fp:
+            right_data = fp.read(1024)
+            memmove(local_right_coe.buf, right_data, len(right_data))
+
+        left_buf_len = c_int(1024)
+        right_buf_len = c_int(1024)
+        ret_left = self.sdk_dll_handle._7i_set_data(b'biLeft', len(b'biLeft'), local_left_coe.buf, left_buf_len)
+        ret_right = self.sdk_dll_handle._7i_set_data(b'biRight', len(b'biRight'), local_right_coe.buf, right_buf_len)
+        if ret_left != 0 or ret_right != 0:
+            raise RuntimeError("failed to load calibration profile: L=%d R=%d" % (ret_left, ret_right))
+
     def stop(self):
         ret = self.sdk_dll_handle._7i_stop()
         print('_7i_stop:%d' % ret)
