@@ -100,14 +100,14 @@ COLUMN_NAMES = [
 class SceneImageLabel(QtWidgets.QLabel):
     """Clickable QLabel for scene camera image (matching official sample)."""
 
-    button_clicked_signal = QtCore.pyqtSignal(int, int)
+    button_clicked_signal = QtCore.pyqtSignal(float, float)
 
     def __init__(self, parent=None):
         super(SceneImageLabel, self).__init__(parent)
 
     def mousePressEvent(self, ev):
         if ev.buttons() == Qt.LeftButton:
-            self.button_clicked_signal.emit(ev.x(), ev.y())
+            self.button_clicked_signal.emit(ev.x() / self.width(), ev.y() / self.height())
 
     def connect_customized_slot(self, slot_func):
         self.button_clicked_signal.connect(slot_func)
@@ -551,6 +551,7 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         self.labelSceneImage.setText("Scene Image")
         self.labelSceneImage.setAlignment(Qt.AlignCenter)
         self.labelSceneImage.setMinimumSize(640, 360)
+        self.labelSceneImage.setScaledContents(True)
         right.addWidget(self.labelSceneImage, stretch=3)
 
         # -- Eye images row --
@@ -718,10 +719,10 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
 
     # ---- Scene image click (calibration point selection) ----
 
-    def _on_scene_image_area_clicked(self, x, y):
+    def _on_scene_image_area_clicked(self, norm_x, norm_y):
         """Convert click position to SDK center-origin coordinates (matching official sample)."""
-        point_x = float(x) - float(self.scene_width / 2)
-        point_y = float(y) - float(self.scene_height / 2)
+        point_x = norm_x * self.scene_width - (self.scene_width / 2)
+        point_y = norm_y * self.scene_height - (self.scene_height / 2)
         print("point:%f %f" % (point_x, point_y))
         self.sdk.set_current_point(point_x, point_y)
 
@@ -771,6 +772,8 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
             self.pushButtonStartCalibration.setEnabled(False)
 
     def _on_stop(self):
+        if self.calibration_is_running:
+            self._on_stop_calibration()
         self.sdk.stop()
         self.pushButtonStop.setEnabled(False)
         self.pushButtonStart.setEnabled(True)
@@ -780,9 +783,16 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
         self.labelRightEyeImage.setPixmap(QPixmap())
         self.sdk_running = False
         self.timer.stop()
+        
+        print("\n===== Logging Session Summary =====")
+        print(f"Eye Tracker Data Frames: {self.packet_count}")
+        
         if self.csv_writer:
+            print(f"Eye Tracker Log Output:  {self.csv_writer.output_file}")
             self.csv_writer.stop()
             self.csv_writer = None
+            
+        print("===================================\n")
 
     # ---- Calibration (click-on-scene pattern, matching official sample) ----
 
