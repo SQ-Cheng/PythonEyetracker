@@ -1,1 +1,7 @@
-/log
+log/
+calibration_profiles/
+__pycache__/
+*.py[cod]
+*.log
+example/test_stdout.txt
+example/test_stderr.txt
