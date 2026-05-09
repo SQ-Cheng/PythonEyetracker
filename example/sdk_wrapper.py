@@ -57,17 +57,23 @@ class wrapper:
     def image_callback(eye, image, size, width, height, timestamp, context):
         self = context
         if 13 == eye:  # scene images
-            ptr = ctypes.cast(image, ctypes.c_void_p)
-            self.h256_dll_handle._7i_h265_decode(size, ptr, self.scene_img_buf.data, self.scene_img_size_max)
-            img = QPixmap.fromImage(QImage(self.scene_img_buf.data, width, height, QImage.Format_BGR888))  # BGR Image
-            wrapper.ui_handle.set_scene_image_signal.emit(img)
+            if wrapper.ui_handle and hasattr(wrapper.ui_handle, "set_scene_image_signal"):
+                ptr = ctypes.cast(image, ctypes.c_void_p)
+                self.h256_dll_handle._7i_h265_decode(size, ptr, self.scene_img_buf.data, self.scene_img_size_max)
+                img = QPixmap.fromImage(QImage(self.scene_img_buf.data, width, height, QImage.Format_BGR888))  # BGR Image
+                wrapper.ui_handle.set_scene_image_signal.emit(img)
         else:
             if PY_7I_EYE_TYPE.L_EYE.value == eye:
-                img = QPixmap.fromImage(QImage(image, width, height, QImage.Format_Indexed8).scaled(160, 120, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation))  # Gray Image
-                wrapper.ui_handle.set_left_eye_image_signal.emit(img)
+                if wrapper.ui_handle and hasattr(wrapper.ui_handle, "set_left_eye_image_signal"):
+                    img = QPixmap.fromImage(QImage(image, width, height, QImage.Format_Indexed8).scaled(160, 120, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation))  # Gray Image
+                    wrapper.ui_handle.set_left_eye_image_signal.emit(img)
             elif PY_7I_EYE_TYPE.R_EYE.value == eye:
-                img = QPixmap.fromImage(QImage(image, width, height, QImage.Format_Indexed8).scaled(160, 120, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation))  # Gray Image
-                wrapper.ui_handle.set_right_eye_image_signal.emit(img)
+                pc_perf_timestamp = time.perf_counter()
+                if wrapper.ui_handle and hasattr(wrapper.ui_handle, "handle_right_eye_frame"):
+                    wrapper.ui_handle.handle_right_eye_frame(image, width, height, int(timestamp), pc_perf_timestamp)
+                if wrapper.ui_handle and hasattr(wrapper.ui_handle, "set_right_eye_image_signal"):
+                    img = QPixmap.fromImage(QImage(image, width, height, QImage.Format_Indexed8).scaled(160, 120, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation))  # Gray Image
+                    wrapper.ui_handle.set_right_eye_image_signal.emit(img)
 
 
 
@@ -78,10 +84,12 @@ class wrapper:
 
         # Emit signals for UI display (matching official sample pattern)
         if wrapper.ui_handle:
-            wrapper.ui_handle.set_pupil_center_signal.emit(
-                obj.left_pupil.pupil_center.x, obj.left_pupil.pupil_center.y,
-                obj.right_pupil.pupil_center.x, obj.right_pupil.pupil_center.y)
-            wrapper.ui_handle.set_gaze_signal.emit(obj.recom_gaze.gaze_point.x, obj.recom_gaze.gaze_point.y)
+            if hasattr(wrapper.ui_handle, "set_pupil_center_signal"):
+                wrapper.ui_handle.set_pupil_center_signal.emit(
+                    obj.left_pupil.pupil_center.x, obj.left_pupil.pupil_center.y,
+                    obj.right_pupil.pupil_center.x, obj.right_pupil.pupil_center.y)
+            if hasattr(wrapper.ui_handle, "set_gaze_signal"):
+                wrapper.ui_handle.set_gaze_signal.emit(obj.recom_gaze.gaze_point.x, obj.recom_gaze.gaze_point.y)
 
         # Also push to data_queue for CSV logging and plots
         sample = {

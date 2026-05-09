@@ -35,11 +35,9 @@ from sdk_wrapper import wrapper
 # ===================== Constants =====================
 # Sensor
 PACKET_SIZE = 64
-SYNC_PACKET_SIZE = 80
 NUM_FLOATS = 14
 SYNC_MARKER = bytes([0x55, 0xAA, 0x55, 0xAA])
 SYNC_LEN = 4
-SYNC_PACKET_FORMAT = '<14fIIHH8x'
 
 DISPLAY_WINDOW_SECONDS = 6.0
 PLOT_UPDATE_INTERVAL_MS = 33
@@ -49,7 +47,6 @@ SERIAL_STARTUP_SETTLE_SECONDS = 2.0
 RATE_WINDOW_SECONDS = 3.0
 TARGET_SERIAL_DESCRIPTION = "Silicon Labs CP210x USB to UART Bridge"
 CALIBRATION_PROFILE_DIR = "calibration_profiles"
-SYNC_EVENT_RETENTION_SECONDS = 5.0
 
 SENSOR_COLUMN_NAMES = [
     'Red', 'IR', 'Green',
@@ -209,6 +206,14 @@ class RingSeries:
                 self.write_index = (self.write_index + 1) % self.size
                 self.count = min(self.size, self.count + 1)
 
+    def clear(self):
+        self.write_index = 0
+        self.count = 0
+        if self.use_numpy:
+            self.values.fill(0.0)
+        else:
+            self.values = [0.0] * self.size
+
     def ordered(self):
         if self.count == 0:
             return np.array([], dtype=np.float64) if self.use_numpy else []
@@ -226,64 +231,6 @@ class RingSeries:
             if count <= 1: return [0.0]
             step = self.window_seconds / (count - 1)
             return [(-self.window_seconds + i * step) for i in range(count)]
-
-
-class AdaptiveRisingEdgeDetector:
-    def __init__(self, history_size=180, min_samples=30, refractory_seconds=0.8):
-        self.history_size = history_size
-        self.min_samples = min_samples
-        self.refractory_seconds = refractory_seconds
-        self.values = deque(maxlen=history_size)
-        self.deltas = deque(maxlen=history_size)
-        self.prev_value = None
-        self.last_event_time = None
-
-    def reset(self):
-        self.values.clear()
-        self.deltas.clear()
-        self.prev_value = None
-        self.last_event_time = None
-
-    def push(self, timestamp, value):
-        value = float(value)
-        if self.prev_value is None:
-            self.prev_value = value
-            self.values.append(value)
-            return None
-
-        delta = value - self.prev_value
-        detected = None
-        if len(self.values) >= self.min_samples and len(self.deltas) >= self.min_samples:
-            value_arr = np.asarray(self.values, dtype=np.float64)
-            delta_arr = np.asarray(self.deltas, dtype=np.float64)
-            value_med = float(np.median(value_arr))
-            delta_med = float(np.median(delta_arr))
-            value_mad = self._mad(value_arr, value_med)
-            delta_mad = self._mad(delta_arr, delta_med)
-            slope_score = (delta - delta_med) / delta_mad
-            level_score = (value - value_med) / value_mad
-            refractory_ok = (
-                self.last_event_time is None
-                or timestamp - self.last_event_time >= self.refractory_seconds
-            )
-            if refractory_ok and slope_score >= 8.0 and level_score >= 3.0:
-                self.last_event_time = timestamp
-                detected = {
-                    "time": float(timestamp),
-                    "value": value,
-                    "slope_score": float(slope_score),
-                    "level_score": float(level_score),
-                }
-
-        self.values.append(value)
-        self.deltas.append(delta)
-        self.prev_value = value
-        return detected
-
-    @staticmethod
-    def _mad(values, median):
-        mad = float(np.median(np.abs(values - median)))
-        return max(mad * 1.4826, 1e-9)
 
 
 class MultiSeriesBuffer:
@@ -326,14 +273,12 @@ def sync_timestamps(ser, rounds=20):
     return best_offset
 
 class SerialPacketReader:
-    def __init__(self, port, baudrate, packet_mode="normal"):
+    def __init__(self, port, baudrate):
         self.port = port
         self.baudrate = baudrate
-        self.packet_mode = packet_mode
-        self.packet_size = SYNC_PACKET_SIZE if packet_mode == "sync" else PACKET_SIZE
+        self.packet_size = PACKET_SIZE
         self.serial_port = None
         self.packet_queue = queue.SimpleQueue()
-        self.ack_queue = queue.SimpleQueue()
         self._buffer = bytearray()
         self._text_buffer = bytearray()
         self._write_lock = threading.Lock()
@@ -380,14 +325,6 @@ class SerialPacketReader:
             self.serial_port.write(command_text.encode("ascii"))
             self.serial_port.flush()
 
-    def send_sync_start(self, sync_id):
-        if not self.serial_port or not self.serial_port.is_open:
-            return None
-        with self._write_lock:
-            self.serial_port.write(f"SYNC_START {int(sync_id)}\n".encode("ascii"))
-            self.serial_port.flush()
-            return time.perf_counter()
-
     def _read_loop(self):
         while not self._stop_event.is_set():
             if not self.serial_port.is_open: break
@@ -418,19 +355,7 @@ class SerialPacketReader:
             payload = bytes(self._buffer[SYNC_LEN:self.packet_size])
             del self._buffer[:self.packet_size]
             try:
-                if self.packet_mode == "sync":
-                    unpacked = struct.unpack(SYNC_PACKET_FORMAT, payload)
-                    values = unpacked[:NUM_FLOATS]
-                    sync_trigger_us = int(unpacked[NUM_FLOATS])
-                    sample_us = int(unpacked[NUM_FLOATS + 1])
-                    sync_id = int(unpacked[NUM_FLOATS + 2])
-                    sync_flags = int(unpacked[NUM_FLOATS + 3])
-                else:
-                    values = struct.unpack('<14f', payload[:NUM_FLOATS * 4])
-                    sync_trigger_us = None
-                    sample_us = None
-                    sync_id = None
-                    sync_flags = None
+                values = struct.unpack('<14f', payload[:NUM_FLOATS * 4])
             except struct.error: continue
 
             if sum(1 for v in values if v != v) > 3: continue
@@ -443,14 +368,6 @@ class SerialPacketReader:
                 "gz": values[8], "mx": values[9], "my": values[10], "mz": values[11], "temp": values[12],
                 "timestamp_ms": values[13],
             }
-            if self.packet_mode == "sync":
-                packet.update({
-                    "sync_id": sync_id,
-                    "sync_trigger_us": sync_trigger_us,
-                    "sync_sample_us": sample_us,
-                    "sync_flags": sync_flags,
-                    "timestamp_ms": sample_us / 1000.0,
-                })
             self.packet_queue.put(packet)
 
     def _marker_prefix_len(self):
@@ -470,18 +387,7 @@ class SerialPacketReader:
             self._handle_text_line(line.decode("ascii", errors="ignore").strip())
 
     def _handle_text_line(self, line):
-        if not line:
-            return
-        parts = line.split()
-        if len(parts) >= 3 and parts[0] == "SYNC_ACK":
-            try:
-                self.ack_queue.put({
-                    "sync_id": int(parts[1]),
-                    "trigger_us": int(parts[2]),
-                    "ack_pc": time.perf_counter(),
-                })
-            except ValueError:
-                pass
+        return
 
 
 # ===================== CSV Writers =====================
@@ -613,24 +519,6 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.finish_points = [[1, 1], [1, 1], [1, 1], [1, 1], [1, 1], [1, 1], [1, 1], [1, 1], [1, 1]]
 
         self.system_running = False
-        self.sync_running = False
-        self.sync_target_count = 3
-        self.sync_results = []
-        self.sync_output_file = None
-        self.sync_ppg_events = deque()
-        self.sync_left_events = deque()
-        self.sync_right_events = deque()
-        self.sync_next_id = 1
-        self.sync_pending_triggers = {}
-        self.sync_current_trigger = None
-        self.sync_confirmation_pending = False
-        self.sync_ppg_detectors = {
-            "Red": AdaptiveRisingEdgeDetector(history_size=250, min_samples=40),
-            "IR": AdaptiveRisingEdgeDetector(history_size=250, min_samples=40),
-            "Green": AdaptiveRisingEdgeDetector(history_size=250, min_samples=40),
-        }
-        self.sync_left_detector = AdaptiveRisingEdgeDetector(history_size=90, min_samples=12)
-        self.sync_right_detector = AdaptiveRisingEdgeDetector(history_size=90, min_samples=12)
 
         self._build_ui()
         self._connect_signals()
@@ -701,29 +589,6 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         sidebar.addWidget(self.btn_start)
         sidebar.addWidget(self.btn_stop)
 
-        # Sync Mode
-        grp_sync = QtWidgets.QGroupBox("Sync Mode")
-        grp_sync.setStyleSheet(group_ss)
-        grp_sync.setFixedWidth(sidebar_width)
-        lo_sync = QtWidgets.QVBoxLayout(grp_sync)
-        self.spin_sync_count = QtWidgets.QSpinBox()
-        self.spin_sync_count.setRange(3, 30)
-        self.spin_sync_count.setValue(3)
-        self.spin_sync_count.setStyleSheet(combo_ss)
-        self.btn_sync_start = QtWidgets.QPushButton("Start Sync")
-        self.btn_sync_start.setStyleSheet(btn_ss)
-        self.btn_sync_stop = QtWidgets.QPushButton("Stop Sync")
-        self.btn_sync_stop.setStyleSheet(btn_ss)
-        self.btn_sync_stop.setEnabled(False)
-        self.lbl_sync_status = QtWidgets.QLabel("Sync: idle")
-        self.lbl_sync_status.setStyleSheet(f"font-size: 12px; color: {t['label_color']};")
-        lo_sync.addWidget(QtWidgets.QLabel("Flash count:"))
-        lo_sync.addWidget(self.spin_sync_count)
-        lo_sync.addWidget(self.btn_sync_start)
-        lo_sync.addWidget(self.btn_sync_stop)
-        lo_sync.addWidget(self.lbl_sync_status)
-        sidebar.addWidget(grp_sync)
-        
         # Sensor Settings
         grp_sensor = QtWidgets.QGroupBox("Sensor Settings")
         grp_sensor.setStyleSheet(group_ss)
@@ -1050,381 +915,9 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
             return
         self._load_selected_calibration_profile(show_message=True)
 
-    def _reset_sync_state(self):
-        self.sync_results = []
-        self.sync_output_file = None
-        self.sync_ppg_events.clear()
-        self.sync_left_events.clear()
-        self.sync_right_events.clear()
-        self.sync_next_id = 1
-        self.sync_pending_triggers.clear()
-        self.sync_current_trigger = None
-        self.sync_confirmation_pending = False
-        for detector in self.sync_ppg_detectors.values():
-            detector.reset()
-        self.sync_left_detector.reset()
-        self.sync_right_detector.reset()
-
-    def _set_sync_controls_running(self, running):
-        self.btn_sync_start.setEnabled(not running and not self.system_running)
-        self.btn_sync_stop.setEnabled(running)
-        self.spin_sync_count.setEnabled(not running)
-        self.btn_start.setEnabled(not running and not self.system_running)
-        self.btn_stop.setEnabled(self.system_running)
-
-    def _on_start_sync(self):
-        if self.system_running:
-            QtWidgets.QMessageBox.warning(self, "Warning", "Stop normal logging before starting sync mode.")
-            return
-        if self.sync_running:
-            return
-
-        self._populate_sensor_ports()
-        selected_port = self.combo_port.currentData()
-        if not selected_port:
-            QtWidgets.QMessageBox.warning(self, "Warning", f"No '{TARGET_SERIAL_DESCRIPTION}' serial port found.")
-            return
-
-        self.sync_target_count = int(self.spin_sync_count.value())
-        self._reset_sync_state()
-        self.sync_output_file = os.path.join(
-            self.log_dir,
-            f"sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        )
-        self.lbl_sync_status.setText(f"Sync: 0/{self.sync_target_count}")
-
-        self.sensor_reader = SerialPacketReader(selected_port, int(self.combo_baud.currentText()), packet_mode="sync")
-        if not self.sensor_reader.open():
-            self.sensor_reader = None
-            QtWidgets.QMessageBox.warning(self, "Warning", "Sensor failed to connect.")
-            return
-
-        time.sleep(SERIAL_STARTUP_SETTLE_SECONDS)
-        self.sensor_reader.serial_port.reset_input_buffer()
-        self.sensor_reader.serial_port.reset_output_buffer()
-        if not self.sensor_reader.start():
-            self.sensor_reader.stop()
-            self.sensor_reader = None
-            QtWidgets.QMessageBox.warning(self, "Warning", "Sensor reader thread failed to start.")
-            return
-
-        pwd = self._read_pwd()
-        if self.eye_sdk.connect_softdog(pwd) != 0:
-            self._stop_sync_devices()
-            QtWidgets.QMessageBox.warning(self, "Warning", "Eye tracker dog connect failed.")
-            return
-
-        env = self.combo_env.currentData()
-        res = self.combo_res.currentData()
-        self.scene_width, self.scene_height = (1280, 960) if res == 201 else (1280, 720) if res == 202 else (800, 600) if res == 203 else (1920, 1080)
-        if self.eye_sdk.start(env, res, self.scene_width, self.scene_height) != 0:
-            self._stop_sync_devices()
-            QtWidgets.QMessageBox.warning(self, "Warning", "Eye tracker start failed.")
-            return
-
-        self._on_set_sdk_running(True)
-        self._load_selected_calibration_profile(show_message=False)
-        self.sync_running = True
-        self._set_sync_controls_running(True)
-        self.lbl_sync_status.setText("Sync: settling camera baseline")
-        self.timer.start(PLOT_UPDATE_INTERVAL_MS)
-        QtCore.QTimer.singleShot(1000, self._send_next_sync_trigger)
-
-    def _on_stop_sync(self):
-        if not self.sync_running:
-            return
-        self.sync_running = False
-        self.timer.stop()
-        self._stop_sync_devices()
-        self._save_sync_results()
-        self._set_sync_controls_running(False)
-        self._update_sync_status(final=True)
-
-    def _stop_sync_devices(self):
-        if self.sensor_reader:
-            try:
-                self.sensor_reader.send_command("e\n")
-                time.sleep(0.3)
-            except Exception:
-                pass
-            self.sensor_reader.stop()
-            self.sensor_reader = None
-
-        if self.eye_sdk_running:
-            if self.calibration_is_running:
-                self._on_stop_calibration()
-            self.eye_sdk.stop()
-            self._on_set_sdk_running(False)
-
-    def _send_next_sync_trigger(self):
-        if not self.sync_running or self.sync_confirmation_pending:
-            return
-        if len(self.sync_results) >= self.sync_target_count:
-            return
-        if not self.sensor_reader:
-            return
-
-        sync_id = self.sync_next_id
-        send_pc = self.sensor_reader.send_sync_start(sync_id)
-        if send_pc is None:
-            QtWidgets.QMessageBox.warning(self, "Warning", "Failed to send SYNC_START to sensor.")
-            self._on_stop_sync()
-            return
-
-        self.sync_pending_triggers[sync_id] = {"sync_id": sync_id, "send_pc": send_pc}
-        self.sync_next_id += 1
-        self.lbl_sync_status.setText(
-            f"Sync: {len(self.sync_results)}/{self.sync_target_count}, trigger {sync_id} sent"
-        )
-
-    def _process_sync_acks(self):
-        if not self.sensor_reader:
-            return
-        while True:
-            try:
-                ack = self.sensor_reader.ack_queue.get_nowait()
-            except queue.Empty:
-                break
-
-            pending = self.sync_pending_triggers.pop(ack["sync_id"], None)
-            if pending is None:
-                continue
-            send_pc = pending["send_pc"]
-            trigger_pc = (send_pc + ack["ack_pc"]) / 2.0
-            self.sync_current_trigger = {
-                "sync_id": ack["sync_id"],
-                "send_pc": send_pc,
-                "ack_pc": ack["ack_pc"],
-                "trigger_pc": trigger_pc,
-                "trigger_us": ack["trigger_us"],
-                "first_left_frame_pc": None,
-                "first_right_frame_pc": None,
-                "eye_event": None,
-            }
-
-    def _check_sync_trigger_timeout(self):
-        if self.sync_confirmation_pending or self.sync_current_trigger:
-            return
-        now = time.perf_counter()
-        expired = [
-            sync_id for sync_id, trigger in self.sync_pending_triggers.items()
-            if now - trigger["send_pc"] > SYNC_EVENT_RETENTION_SECONDS
-        ]
-        for sync_id in expired:
-            self.sync_pending_triggers.pop(sync_id, None)
-            self.lbl_sync_status.setText(
-                f"Sync: {len(self.sync_results)}/{self.sync_target_count}, trigger {sync_id} no ACK"
-            )
-            QtCore.QTimer.singleShot(500, self._send_next_sync_trigger)
-            break
-
-    def _pixmap_mean_brightness(self, pixmap):
-        image = pixmap.toImage().convertToFormat(QtGui.QImage.Format_Grayscale8)
-        width = image.width()
-        height = image.height()
-        if width <= 0 or height <= 0:
-            return None
-        ptr = image.bits()
-        ptr.setsize(image.byteCount())
-        arr = np.frombuffer(ptr, dtype=np.uint8).reshape((height, image.bytesPerLine()))
-        return float(arr[:, :width].mean())
-
-    def _process_sync_eye_sample(self, eye_name, timestamp, image):
-        brightness = self._pixmap_mean_brightness(image)
-        if brightness is None:
-            return
-        if self.sync_current_trigger and timestamp >= self.sync_current_trigger["send_pc"]:
-            frame_key = f"first_{eye_name}_frame_pc"
-            if self.sync_current_trigger.get(frame_key) is None:
-                self.sync_current_trigger[frame_key] = timestamp
-        if eye_name == "left":
-            event = self.sync_left_detector.push(timestamp, brightness)
-            if event:
-                event["source"] = "left eye"
-                if self.sync_current_trigger and timestamp >= self.sync_current_trigger["send_pc"]:
-                    event["sync_id"] = self.sync_current_trigger["sync_id"]
-                    self.sync_left_events.append(event)
-        else:
-            event = self.sync_right_detector.push(timestamp, brightness)
-            if event:
-                event["source"] = "right eye"
-                if self.sync_current_trigger and timestamp >= self.sync_current_trigger["send_pc"]:
-                    event["sync_id"] = self.sync_current_trigger["sync_id"]
-                    self.sync_right_events.append(event)
-        self._try_confirm_sync_event(timestamp)
-
-    def _process_sync_ppg_sample(self, sample):
-        if not self.sync_current_trigger:
-            return
-        if sample.get("sync_id") != self.sync_current_trigger["sync_id"]:
-            return
-        self.sync_current_trigger["last_ppg_sample_us"] = sample.get("sync_sample_us")
-
-    def _try_confirm_sync_event(self, now):
-        if self.sync_confirmation_pending or not self.sync_running:
-            return
-        if not self.sync_current_trigger:
-            return
-        sync_id = self.sync_current_trigger["sync_id"]
-        eye_events = [
-            event for event in list(self.sync_left_events) + list(self.sync_right_events)
-            if event.get("sync_id") == sync_id
-        ]
-        if not eye_events:
-            if now - self.sync_current_trigger["send_pc"] > SYNC_EVENT_RETENTION_SECONDS:
-                self.lbl_sync_status.setText(
-                    f"Sync: {len(self.sync_results)}/{self.sync_target_count}, trigger {sync_id} timed out"
-                )
-                self.sync_current_trigger = None
-                QtCore.QTimer.singleShot(500, self._send_next_sync_trigger)
-            return
-        eye_event = max(eye_events, key=lambda item: item["slope_score"])
-        if eye_event["time"] - self.sync_current_trigger["send_pc"] > SYNC_EVENT_RETENTION_SECONDS:
-            self.lbl_sync_status.setText(
-                f"Sync: {len(self.sync_results)}/{self.sync_target_count}, trigger {sync_id} timed out"
-            )
-            self.sync_current_trigger = None
-            QtCore.QTimer.singleShot(500, self._send_next_sync_trigger)
-            return
-
-        self._discard_sync_events_for_id(sync_id)
-        self.sync_confirmation_pending = True
-
-        trigger_pc = self.sync_current_trigger["trigger_pc"]
-        diff_ms = (trigger_pc - eye_event["time"]) * 1000.0
-        first_left = self.sync_current_trigger.get("first_left_frame_pc")
-        first_right = self.sync_current_trigger.get("first_right_frame_pc")
-        message = (
-            f"Detected flash candidate #{len(self.sync_results) + 1}/{self.sync_target_count}.\n\n"
-            f"SYNC_START id: {sync_id}\n"
-            f"Arduino trigger micros: {self.sync_current_trigger['trigger_us']}\n"
-            f"Camera edge: {eye_event['source']} score {eye_event['slope_score']:.1f}\n"
-            f"First left frame after trigger: {self._format_relative_ms(first_left, trigger_pc)}\n"
-            f"First right frame after trigger: {self._format_relative_ms(first_right, trigger_pc)}\n"
-            f"Sensor trigger - camera edge: {diff_ms:.2f} ms\n\n"
-            "Approve this sync point?"
-        )
-        reply = QtWidgets.QMessageBox.question(
-            self,
-            "Confirm Sync Flash",
-            message,
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.Yes,
-        )
-
-        if reply == QtWidgets.QMessageBox.Yes:
-            self.sync_results.append({
-                "sync_id": sync_id,
-                "trigger_us": self.sync_current_trigger["trigger_us"],
-                "trigger_pc": trigger_pc,
-                "eye_source": eye_event["source"],
-                "eye_time": eye_event["time"],
-                "diff_ms": diff_ms,
-                "first_left_frame_delta_ms": None if first_left is None else (first_left - trigger_pc) * 1000.0,
-                "first_right_frame_delta_ms": None if first_right is None else (first_right - trigger_pc) * 1000.0,
-            })
-            self._update_sync_status()
-            if len(self.sync_results) >= self.sync_target_count:
-                avg_ms = self._sync_average_ms()
-                QtWidgets.QMessageBox.information(
-                    self,
-                    "Sync Complete",
-                    f"Sync complete.\nAverage PPG - eye timestamp difference: {avg_ms:.2f} ms",
-                )
-                self._on_stop_sync()
-            else:
-                self.sync_current_trigger = None
-                QtCore.QTimer.singleShot(500, self._send_next_sync_trigger)
-        else:
-            self._update_sync_status(rejected=True)
-            self.sync_current_trigger = None
-            QtCore.QTimer.singleShot(500, self._send_next_sync_trigger)
-
-        self.sync_confirmation_pending = False
-
-    def _update_sync_status(self, final=False, rejected=False):
-        count = len(self.sync_results)
-        if count:
-            avg_ms = self._sync_average_ms()
-            suffix = f", avg {avg_ms:.2f} ms"
-        else:
-            suffix = ""
-        if final:
-            prefix = "Sync: stopped"
-        elif rejected:
-            prefix = f"Sync: {count}/{self.sync_target_count}, rejected"
-        else:
-            prefix = f"Sync: {count}/{self.sync_target_count}"
-        self.lbl_sync_status.setText(prefix + suffix)
-
-    def _save_sync_results(self):
-        if not self.sync_output_file or not self.sync_results:
-            return
-        avg_ms = self._sync_average_ms()
-        with open(self.sync_output_file, "w", newline="") as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow([
-                "index",
-                "sync_id",
-                "arduino_trigger_us",
-                "sensor_trigger_minus_camera_edge_ms",
-                "camera_source",
-                "first_left_frame_delta_ms",
-                "first_right_frame_delta_ms",
-            ])
-            for index, result in enumerate(self.sync_results, start=1):
-                writer.writerow([
-                    index,
-                    result["sync_id"],
-                    result["trigger_us"],
-                    f"{result['diff_ms']:.6f}",
-                    result["eye_source"],
-                    self._format_optional_float(result["first_left_frame_delta_ms"]),
-                    self._format_optional_float(result["first_right_frame_delta_ms"]),
-                ])
-            writer.writerow(["average", f"{avg_ms:.6f}"])
-
-    def _sync_average_ms(self):
-        return float(np.mean([result["diff_ms"] for result in self.sync_results]))
-
-    @staticmethod
-    def _format_relative_ms(timestamp, reference):
-        if timestamp is None:
-            return "--"
-        return f"{(timestamp - reference) * 1000.0:.2f} ms"
-
-    @staticmethod
-    def _format_optional_float(value):
-        return "" if value is None else f"{value:.6f}"
-
-    def _trim_sync_events(self, now):
-        cutoff = now - SYNC_EVENT_RETENTION_SECONDS
-        for events in (self.sync_ppg_events, self.sync_left_events, self.sync_right_events):
-            while events and events[0]["time"] < cutoff:
-                events.popleft()
-
-    @staticmethod
-    def _nearest_event(events, target_time):
-        if not events:
-            return None
-        return min(events, key=lambda item: abs(item["time"] - target_time))
-
-    @staticmethod
-    def _discard_sync_event(events, target_event):
-        try:
-            events.remove(target_event)
-        except ValueError:
-            pass
-
-    def _discard_sync_events_for_id(self, sync_id):
-        self.sync_left_events = deque(event for event in self.sync_left_events if event.get("sync_id") != sync_id)
-        self.sync_right_events = deque(event for event in self.sync_right_events if event.get("sync_id") != sync_id)
-
     def _connect_signals(self):
         self.btn_start.clicked.connect(self._on_start_all)
         self.btn_stop.clicked.connect(self._on_stop_all)
-        self.btn_sync_start.clicked.connect(self._on_start_sync)
-        self.btn_sync_stop.clicked.connect(self._on_stop_sync)
         self.btn_cal_start.clicked.connect(self._on_start_calibration)
         self.btn_cal_stop.clicked.connect(self._on_stop_calibration)
         self.btn_refresh_profiles.clicked.connect(self._refresh_calibration_profiles)
@@ -1452,13 +945,9 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
     
     def _display_left_eye_image(self, image):
         self.labelLeftEye.setPixmap(image)
-        if self.sync_running:
-            self._process_sync_eye_sample("left", time.perf_counter(), image)
 
     def _display_right_eye_image(self, image):
         self.labelRightEye.setPixmap(image)
-        if self.sync_running:
-            self._process_sync_eye_sample("right", time.perf_counter(), image)
 
     def _display_pupil_data(self, lx, ly, rx, ry):
         self.lbl_pupil_x.setText(f"{lx:.5f}"); self.lbl_pupil_y.setText(f"{rx:.5f}")
@@ -1535,12 +1024,8 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         return cf.get("softdog", "pwd", fallback="").encode("utf-8")
 
     def _on_start_all(self):
-        if self.sync_running:
-            QtWidgets.QMessageBox.warning(self, "Warning", "Stop sync mode before starting normal logging.")
-            return
         self.system_running = True
         self.btn_start.setEnabled(False)
-        self._set_sync_controls_running(False)
         self._populate_sensor_ports()
         self.sensor_reader = None
         self.eye_sdk_running = False
@@ -1600,7 +1085,6 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.timer.stop()
         self.btn_stop.setEnabled(False)
         self.btn_start.setEnabled(True)
-        self._set_sync_controls_running(False)
         self.btn_cal_start.setEnabled(False)
         self.btn_cal_stop.setEnabled(False)
         self._update_calibration_profile_controls()
@@ -1637,10 +1121,6 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
     # ---- Timer Update ----
     def _on_timer(self):
         now_ms = time.perf_counter() * 1000
-        if self.sync_running:
-            self._process_sync_acks()
-            self._check_sync_trigger_timeout()
-
         # Drain Sensor
         if self.sensor_reader:
             red_b, ir_b, green_b, ax_b, ay_b, az_b, gx_b, gy_b, gz_b, mx_b, my_b, mz_b = ([] for _ in range(12))
@@ -1654,9 +1134,6 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
                 gx_b.append(p["gx"]); gy_b.append(p["gy"]); gz_b.append(p["gz"])
                 mx_b.append(p["mx"]); my_b.append(p["my"]); mz_b.append(p["mz"])
                 self.sensor_latest_temp = p["temp"]
-                if self.sync_running:
-                    self._process_sync_ppg_sample(p)
-                
                 if self.sensor_csv_writer:
                     pc_ts = p["timestamp_ms"]/1000.0 + self.ts_offset
                     self.sensor_csv_writer.push([p["red"], p["ir"], p["green"], p["ax"], p["ay"], p["az"],
@@ -1751,7 +1228,6 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event):
         if self.system_running: self._on_stop_all()
-        if self.sync_running: self._on_stop_sync()
         super().closeEvent(event)
 
 
