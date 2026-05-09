@@ -28,6 +28,12 @@ from PyQt5.QtCore import Qt, QRectF
 import pyqtgraph as pg
 
 # ---- Eye Tracker SDK Imports ----
+from example_paths import (
+    CALIBRATION_PROFILE_DIR as SHARED_CALIBRATION_PROFILE_DIR,
+    LOG_DIR,
+    add_sdk_root_argument,
+    sdk_config_dir,
+)
 from sdk_types import PY_7I_ENVIRONMENT, PY_7I_RESOLUTION
 from sdk_wrapper import wrapper
 
@@ -46,8 +52,6 @@ Y_LIMIT_UPDATE_INTERVAL_MS = 500
 SERIAL_STARTUP_SETTLE_SECONDS = 2.0
 RATE_WINDOW_SECONDS = 3.0
 TARGET_SERIAL_DESCRIPTION = "Silicon Labs CP210x USB to UART Bridge"
-CALIBRATION_PROFILE_DIR = "calibration_profiles"
-
 SENSOR_COLUMN_NAMES = [
     'Red', 'IR', 'Green',
     'accX', 'accY', 'accZ',
@@ -470,9 +474,8 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.args = args
         self.theme = THEME_DARK if detect_dark_theme() else THEME_LIGHT
-        self.project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self.log_dir = os.path.join(self.project_root, "log")
-        self.calibration_root = os.path.join(self.project_root, CALIBRATION_PROFILE_DIR)
+        self.log_dir = os.fspath(LOG_DIR)
+        self.calibration_root = os.fspath(SHARED_CALIBRATION_PROFILE_DIR)
         os.makedirs(self.log_dir, exist_ok=True)
         os.makedirs(self.calibration_root, exist_ok=True)
 
@@ -505,7 +508,7 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
 
         # Eye tracker Component
         self.eye_sdk = wrapper()
-        self.eye_sdk_config_path = os.path.join(args.sdk_root, "bin", "config")
+        self.eye_sdk_config_path = os.fspath(sdk_config_dir(args.sdk_root))
         self.eye_sdk.load_library(self.eye_sdk_config_path)
         self.eye_sdk.set_ui_handle(self)
         
@@ -1233,7 +1236,7 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sdk-root", default="E:/7invensun/aSeeGlassesPlusUserSDK")
+    add_sdk_root_argument(parser)
     parser.add_argument("--port", type=str, default="COM5")
     parser.add_argument("--baud", type=int, default=1000000)
     parser.add_argument("--sensor-sample-rate", type=float, default=250.0)

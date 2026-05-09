@@ -1,19 +1,19 @@
 import time
+import configparser
+import os
+
+from example_paths import sdk_config_dir
 from sdk_wrapper import wrapper
-from sdk_types import PY_7I_RESOLUTION
 
 def main():
     print("Initializing SDK...")
     sdk = wrapper()
-    
-    # Path to config must point to the original bin directory or a copied config
-    config_path = b'E:/7invensun/aSeeGlassesPlusUserSDK/bin/config'
+
+    config_path = os.fspath(sdk_config_dir())
     sdk.load_library(config_path)
-    
-    # Reading pwd from config.ini
-    import configparser
+
     cf = configparser.ConfigParser()
-    cf.read('E:/7invensun/aSeeGlassesPlusUserSDK/bin/config/config.ini')
+    cf.read(os.path.join(config_path, "config.ini"))
     pwd = cf.get('softdog', 'pwd', fallback="").encode('utf-8')
 
     print(f"Connecting to softdog with pwd {pwd}...")

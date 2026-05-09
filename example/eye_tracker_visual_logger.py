@@ -21,6 +21,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtGui import QPainter, QColor, QBrush, QPen, QPixmap, QFont
 from PyQt5.QtCore import Qt, QRectF
 
+from example_paths import LOG_DIR, add_sdk_root_argument, sdk_config_dir
 from sdk_types import PY_7I_ENVIRONMENT, PY_7I_RESOLUTION
 from sdk_wrapper import wrapper
 import pyqtgraph as pg
@@ -284,12 +285,11 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
 
     def __init__(self, sdk_root, sample_rate_hz, window_seconds):
         super().__init__()
-        self.sdk_root = sdk_root
         self.sample_rate_hz = sample_rate_hz
         self.window_seconds = window_seconds
 
         self.sdk = wrapper()
-        self.sdk_config_path = os.path.join(self.sdk_root, "bin", "config")
+        self.sdk_config_path = os.fspath(sdk_config_dir(sdk_root))
         self.sdk.load_library(self.sdk_config_path)
         self.sdk.set_ui_handle(self)
 
@@ -846,10 +846,9 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
             self.pushButtonStartCalibration.setEnabled(True)
 
             # Start CSV logging
-            log_dir = os.path.join(os.path.dirname(os.getcwd()), "log")
-            os.makedirs(log_dir, exist_ok=True)
+            os.makedirs(LOG_DIR, exist_ok=True)
             timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_file = os.path.join(log_dir, f"eye_tracker_{timestamp_str}.csv")
+            output_file = os.path.join(os.fspath(LOG_DIR), f"eye_tracker_{timestamp_str}.csv")
             self.csv_writer = CSVWriterThread(output_file)
             self.csv_writer.start()
             self.log_label.setText(f"Log: {output_file}")
@@ -983,7 +982,7 @@ class EyeTrackerMonitorWindow(QtWidgets.QMainWindow):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Eye tracker visual logger")
-    parser.add_argument("--sdk-root", default="E:/7invensun/aSeeGlassesPlusUserSDK")
+    add_sdk_root_argument(parser)
     parser.add_argument("--sample-rate", type=float, default=120.0)
     parser.add_argument("--window-seconds", type=float, default=DISPLAY_WINDOW_SECONDS)
     return parser.parse_args()
