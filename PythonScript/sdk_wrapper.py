@@ -2,10 +2,6 @@ import os
 import queue
 import threading
 import time
-import struct
-from threading import *
-from PyQt5 import QtCore
-from PyQt5.QtGui import QImage, QPixmap
 from sdk_types import *
 import ctypes
 
@@ -56,45 +52,47 @@ class wrapper:
     @staticmethod
     def image_callback(eye, image, size, width, height, timestamp, context):
         self = context
+        pc_arrival_timestamp = time.perf_counter()
+        ui = wrapper.ui_handle
         if 13 == eye:  # scene images
-            if wrapper.ui_handle and hasattr(wrapper.ui_handle, "set_scene_image_signal"):
-                ptr = ctypes.cast(image, ctypes.c_void_p)
-                self.h256_dll_handle._7i_h265_decode(size, ptr, self.scene_img_buf.data, self.scene_img_size_max)
-                img = QPixmap.fromImage(QImage(self.scene_img_buf.data, width, height, QImage.Format_BGR888))  # BGR Image
-                wrapper.ui_handle.set_scene_image_signal.emit(img)
+            if ui and hasattr(ui, "handle_scene_frame"):
+                if hasattr(ui, "wants_preview_frame") and not ui.wants_preview_frame(eye):
+                    return
+                try:
+                    frame_bytes = ctypes.string_at(image, int(size))
+                    ui.handle_scene_frame(frame_bytes, int(size), int(width), int(height), int(timestamp), pc_arrival_timestamp)
+                except Exception:
+                    pass
         else:
             if PY_7I_EYE_TYPE.L_EYE.value == eye:
-                if wrapper.ui_handle and hasattr(wrapper.ui_handle, "set_left_eye_image_signal"):
-                    img = QPixmap.fromImage(QImage(image, width, height, QImage.Format_Indexed8).scaled(160, 120, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation))  # Gray Image
-                    wrapper.ui_handle.set_left_eye_image_signal.emit(img)
+                if ui and hasattr(ui, "handle_eye_preview_frame"):
+                    if hasattr(ui, "wants_preview_frame") and not ui.wants_preview_frame(eye):
+                        return
+                    try:
+                        frame_bytes = ctypes.string_at(image, int(width) * int(height))
+                        ui.handle_eye_preview_frame(int(eye), frame_bytes, int(width), int(height), int(timestamp), pc_arrival_timestamp)
+                    except Exception:
+                        pass
             elif PY_7I_EYE_TYPE.R_EYE.value == eye:
-                pc_perf_timestamp = time.perf_counter()
-                if wrapper.ui_handle and hasattr(wrapper.ui_handle, "handle_right_eye_frame"):
-                    wrapper.ui_handle.handle_right_eye_frame(image, width, height, int(timestamp), pc_perf_timestamp)
-                if wrapper.ui_handle and hasattr(wrapper.ui_handle, "set_right_eye_image_signal"):
-                    img = QPixmap.fromImage(QImage(image, width, height, QImage.Format_Indexed8).scaled(160, 120, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation))  # Gray Image
-                    wrapper.ui_handle.set_right_eye_image_signal.emit(img)
-
-
+                if ui and hasattr(ui, "handle_right_eye_frame"):
+                    ui.handle_right_eye_frame(image, width, height, int(timestamp), pc_arrival_timestamp)
+                if ui and hasattr(ui, "handle_eye_preview_frame"):
+                    if hasattr(ui, "wants_preview_frame") and not ui.wants_preview_frame(eye):
+                        return
+                    try:
+                        frame_bytes = ctypes.string_at(image, int(width) * int(height))
+                        ui.handle_eye_preview_frame(int(eye), frame_bytes, int(width), int(height), int(timestamp), pc_arrival_timestamp)
+                    except Exception:
+                        pass
 
     @staticmethod
     def gaze_callback(eyes, context):
         self = context
+        pc_arrival_timestamp = time.perf_counter()
         obj = eyes.__getitem__(0)
 
-        # Emit signals for UI display (matching official sample pattern)
-        if wrapper.ui_handle:
-            if hasattr(wrapper.ui_handle, "set_pupil_center_signal"):
-                wrapper.ui_handle.set_pupil_center_signal.emit(
-                    obj.left_pupil.pupil_center.x, obj.left_pupil.pupil_center.y,
-                    obj.right_pupil.pupil_center.x, obj.right_pupil.pupil_center.y)
-            if hasattr(wrapper.ui_handle, "set_gaze_signal"):
-                wrapper.ui_handle.set_gaze_signal.emit(obj.recom_gaze.gaze_point.x, obj.recom_gaze.gaze_point.y)
-
-        # Also push to data_queue for CSV logging and plots
         sample = {
-            "pc_timestamp": time.time(),
-            "perf_timestamp": time.perf_counter(),
+            "pc_arrival_timestamp": pc_arrival_timestamp,
             "device_timestamp": int(obj.timestamp),
             "gaze_x": float(obj.recom_gaze.gaze_point.x),
             "gaze_y": float(obj.recom_gaze.gaze_point.y),

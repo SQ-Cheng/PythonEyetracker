@@ -9,6 +9,8 @@ Uses PyQt5. Start/Stop manages both devices simultaneously. Data is logged to 2 
 import argparse
 import configparser
 import csv
+import ctypes
+import json
 import os
 import queue
 import struct
@@ -16,14 +18,24 @@ import sys
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Optional
+import wave
 
 import numpy as np
 import serial
 from serial.tools import list_ports
 
+try:
+    import sounddevice as sd
+    SOUNDDEVICE_IMPORT_ERROR = None
+except Exception as exc:
+    sd = None
+    SOUNDDEVICE_IMPORT_ERROR = exc
+
 from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtGui import QPainter, QColor, QBrush, QPen, QPixmap, QFont
+from PyQt5.QtGui import QPainter, QColor, QBrush, QPixmap, QFont, QImage
 from PyQt5.QtCore import Qt, QRectF
 import pyqtgraph as pg
 
@@ -34,7 +46,6 @@ from example_paths import (
     add_sdk_root_argument,
     sdk_config_dir,
 )
-from sdk_types import PY_7I_ENVIRONMENT, PY_7I_RESOLUTION
 from sdk_wrapper import wrapper
 
 
@@ -49,7 +60,6 @@ DISPLAY_WINDOW_SECONDS = 6.0
 PLOT_UPDATE_INTERVAL_MS = 33
 METRIC_UPDATE_INTERVAL_MS = 250
 Y_LIMIT_UPDATE_INTERVAL_MS = 500
-SERIAL_STARTUP_SETTLE_SECONDS = 2.0
 RATE_WINDOW_SECONDS = 3.0
 TARGET_SERIAL_DESCRIPTION = "Silicon Labs CP210x USB to UART Bridge"
 SENSOR_COLUMN_NAMES = [
@@ -57,14 +67,33 @@ SENSOR_COLUMN_NAMES = [
     'accX', 'accY', 'accZ',
     'gyrX', 'gyrY', 'gyrZ',
     'magX', 'magY', 'magZ',
-    'temp', 'timestamp', 'pc_timestamp'
+    'temp', 'device_timestamp_ms', 'pc_arrival_timestamp'
 ]
 
 EYE_COLUMN_NAMES = [
-    "pc_timestamp", "device_timestamp", "gaze_x", "gaze_y", "gaze_z",
+    "device_timestamp", "pc_arrival_timestamp", "gaze_x", "gaze_y", "gaze_z",
     "left_pupil_x", "left_pupil_y", "right_pupil_x", "right_pupil_y",
     "left_pupil_diameter_mm", "right_pupil_diameter_mm",
     "left_openness", "right_openness", "left_blink", "right_blink"
+]
+
+AUDIO_CHANNELS = 1
+AUDIO_DTYPE = "int16"
+AUDIO_SAMPLE_WIDTH_BYTES = 2
+AUDIO_ANCHOR_INTERVAL_SECONDS = 1.0
+AUDIO_SAMPLE_RATE_OPTIONS = (8000, 16000, 22050, 32000, 44100, 48000, 96000)
+AUDIO_TIMESTAMP_COLUMN_NAMES = [
+    "sample_index",
+    "sample_offset_seconds",
+    "pc_perf_timestamp",
+    "callback_pc_perf_timestamp",
+    "pa_input_buffer_adc_time",
+    "pa_current_time",
+    "pc_clock_offset",
+    "block_start_sample_index",
+    "frames_in_block",
+    "status_flags",
+    "clock_source",
 ]
 
 
@@ -151,6 +180,14 @@ class SceneImageLabel(AspectRatioPixmapLabel):
 
 
 class SensorPortComboBox(QtWidgets.QComboBox):
+    popup_requested = QtCore.pyqtSignal()
+
+    def showPopup(self):
+        self.popup_requested.emit()
+        super().showPopup()
+
+
+class AudioDeviceComboBox(QtWidgets.QComboBox):
     popup_requested = QtCore.pyqtSignal()
 
     def showPopup(self):
@@ -254,28 +291,6 @@ class MultiSeriesBuffer:
 
 
 # ===================== Sensor Component =====================
-def sync_timestamps(ser, rounds=20):
-    best_rtt = float("inf")
-    best_offset = 0.0
-    success_count = 0
-    for _ in range(rounds):
-        ser.reset_input_buffer()
-        t1 = time.perf_counter()
-        ser.write(b"t\n")
-        ser.flush()
-        response = ser.readline()
-        t2 = time.perf_counter()
-        if not response or not response.startswith(b"T"): continue
-        try: arduino_ms = int(response[1:].strip())
-        except ValueError: continue
-        rtt = t2 - t1
-        offset = (t1 + t2) / 2.0 - arduino_ms / 1000.0
-        if rtt < best_rtt:
-            best_rtt = rtt
-            best_offset = offset
-        success_count += 1
-    return best_offset
-
 class SerialPacketReader:
     def __init__(self, port, baudrate):
         self.port = port
@@ -292,7 +307,7 @@ class SerialPacketReader:
 
     def open(self):
         try:
-            self.serial_port = serial.Serial(port=self.port, baudrate=self.baudrate, timeout=0.05)
+            self.serial_port = serial.Serial(port=self.port, baudrate=self.baudrate, timeout=0.01)
             self._stop_event.clear()
             return True
         except Exception as e:
@@ -358,19 +373,20 @@ class SerialPacketReader:
             if len(self._buffer) < self.packet_size: return
             payload = bytes(self._buffer[SYNC_LEN:self.packet_size])
             del self._buffer[:self.packet_size]
+            pc_arrival_timestamp = time.perf_counter()
             try:
                 values = struct.unpack('<14f', payload[:NUM_FLOATS * 4])
             except struct.error: continue
 
             if sum(1 for v in values if v != v) > 3: continue
-            timestamp = values[13]
-            if timestamp == timestamp and (timestamp < 0 or timestamp > 4.3e9): continue
+            device_timestamp_ms = values[13]
+            if device_timestamp_ms == device_timestamp_ms and (device_timestamp_ms < 0 or device_timestamp_ms > 4.3e9): continue
 
             packet = {
-                "timestamp": time.perf_counter(), "red": values[0], "ir": values[1], "green": values[2],
+                "pc_arrival_timestamp": pc_arrival_timestamp, "red": values[0], "ir": values[1], "green": values[2],
                 "ax": values[3], "ay": values[4], "az": values[5], "gx": values[6], "gy": values[7],
                 "gz": values[8], "mx": values[9], "my": values[10], "mz": values[11], "temp": values[12],
-                "timestamp_ms": values[13],
+                "device_timestamp_ms": device_timestamp_ms,
             }
             self.packet_queue.put(packet)
 
@@ -394,80 +410,331 @@ class SerialPacketReader:
         return
 
 
+# ===================== Audio Component =====================
+@dataclass
+class AudioBlock:
+    audio_bytes: bytes
+    frames: int
+    sample_index: int
+    pc_perf_timestamp: float
+    callback_pc_perf_timestamp: float
+    pa_input_buffer_adc_time: Optional[float]
+    pa_current_time: Optional[float]
+    pc_clock_offset: Optional[float]
+    status_flags: str
+    clock_source: str
+
+
+class AudioRecorder:
+    def __init__(self, device_index, device_name, sample_rate, wav_file, timestamp_file, metadata_file):
+        if sd is None:
+            raise RuntimeError(f"sounddevice is not available: {SOUNDDEVICE_IMPORT_ERROR}")
+
+        self.device_index = int(device_index)
+        self.device_name = str(device_name)
+        self.sample_rate = int(sample_rate)
+        self.wav_file = wav_file
+        self.timestamp_file = timestamp_file
+        self.metadata_file = metadata_file
+
+        self.queue = queue.SimpleQueue()
+        self._stop_event = threading.Event()
+        self._writer_thread = threading.Thread(target=self._write_loop, daemon=True)
+        self._stream = None
+        self._sample_lock = threading.Lock()
+        self._loudness_lock = threading.Lock()
+        self._next_sample_index = 0
+        self._next_anchor_sample_index = 0
+        self._anchor_interval_frames = max(1, int(round(self.sample_rate * AUDIO_ANCHOR_INTERVAL_SECONDS)))
+
+        self.frames_captured = 0
+        self.frames_written = 0
+        self.blocks_captured = 0
+        self.anchors_written = 0
+        self.started_pc_perf_timestamp = None
+        self.stopped_pc_perf_timestamp = None
+        self.latest_loudness_percent = 0
+        self.latest_loudness_dbfs = None
+        self.latest_loudness_timestamp = None
+        self.error = None
+
+    def start(self):
+        sd.check_input_settings(
+            device=self.device_index,
+            channels=AUDIO_CHANNELS,
+            samplerate=self.sample_rate,
+            dtype=AUDIO_DTYPE,
+        )
+        self.started_pc_perf_timestamp = time.perf_counter()
+        self._writer_thread.start()
+        try:
+            self._stream = sd.InputStream(
+                device=self.device_index,
+                channels=AUDIO_CHANNELS,
+                samplerate=self.sample_rate,
+                dtype=AUDIO_DTYPE,
+                callback=self._callback,
+            )
+            self._stream.start()
+        except Exception:
+            if self._stream is not None:
+                try:
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
+            self._stop_event.set()
+            self._writer_thread.join(timeout=2.0)
+            raise
+
+    def stop(self):
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+            finally:
+                self._stream.close()
+                self._stream = None
+
+        self.stopped_pc_perf_timestamp = time.perf_counter()
+        self._stop_event.set()
+        self._writer_thread.join(timeout=5.0)
+        if self._writer_thread.is_alive():
+            self.error = self.error or "audio writer did not finish flushing"
+        self._write_metadata()
+        if self.error:
+            raise RuntimeError(f"Audio writer failed: {self.error}")
+
+    def _callback(self, indata, frames, time_info, status):
+        callback_pc = time.perf_counter()
+        pa_adc = self._time_attr(time_info, "inputBufferAdcTime")
+        pa_current = self._time_attr(time_info, "currentTime")
+
+        if pa_adc is not None and pa_current is not None:
+            pc_clock_offset = callback_pc - pa_current
+            block_pc_timestamp = pa_adc + pc_clock_offset
+            clock_source = "portaudio_input_adc"
+        else:
+            pc_clock_offset = None
+            block_pc_timestamp = callback_pc - (float(frames) / float(self.sample_rate))
+            clock_source = "callback_fallback"
+
+        with self._sample_lock:
+            sample_index = self._next_sample_index
+            self._next_sample_index += int(frames)
+            self.frames_captured += int(frames)
+            self.blocks_captured += 1
+
+        audio_bytes = np.asarray(indata, dtype=np.int16).copy(order="C").tobytes()
+        status_flags = str(status).strip() if status else ""
+        self.queue.put(AudioBlock(
+            audio_bytes=audio_bytes,
+            frames=int(frames),
+            sample_index=sample_index,
+            pc_perf_timestamp=float(block_pc_timestamp),
+            callback_pc_perf_timestamp=float(callback_pc),
+            pa_input_buffer_adc_time=pa_adc,
+            pa_current_time=pa_current,
+            pc_clock_offset=pc_clock_offset,
+            status_flags=status_flags,
+            clock_source=clock_source,
+        ))
+
+    def _write_loop(self):
+        try:
+            with wave.open(self.wav_file, "wb") as wav_file, open(self.timestamp_file, "w", newline="") as csvfile:
+                wav_file.setnchannels(AUDIO_CHANNELS)
+                wav_file.setsampwidth(AUDIO_SAMPLE_WIDTH_BYTES)
+                wav_file.setframerate(self.sample_rate)
+                writer = csv.writer(csvfile)
+                writer.writerow(AUDIO_TIMESTAMP_COLUMN_NAMES)
+
+                while not self._stop_event.is_set() or not self.queue.empty():
+                    try:
+                        block = self.queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+
+                    wav_file.writeframes(block.audio_bytes)
+                    self.frames_written += block.frames
+                    self._update_loudness(block.audio_bytes, block.callback_pc_perf_timestamp)
+                    self._write_timestamp_anchors(writer, block)
+        except Exception as exc:
+            self.error = exc
+
+    def latest_loudness(self):
+        with self._loudness_lock:
+            return self.latest_loudness_percent, self.latest_loudness_dbfs, self.latest_loudness_timestamp
+
+    def _update_loudness(self, audio_bytes, timestamp):
+        samples = np.frombuffer(audio_bytes, dtype=np.int16)
+        if samples.size == 0:
+            return
+
+        values = samples.astype(np.float32, copy=False)
+        rms = float(np.sqrt(np.mean(values * values)))
+        if rms <= 0.0:
+            dbfs = -90.0
+        else:
+            dbfs = 20.0 * np.log10(rms / 32768.0)
+        dbfs = max(-90.0, min(0.0, float(dbfs)))
+        percent = int(round(max(0.0, min(1.0, (dbfs + 60.0) / 60.0)) * 100.0))
+
+        with self._loudness_lock:
+            self.latest_loudness_percent = percent
+            self.latest_loudness_dbfs = dbfs
+            self.latest_loudness_timestamp = float(timestamp)
+
+    def _write_timestamp_anchors(self, writer, block):
+        block_end = block.sample_index + block.frames
+        while self._next_anchor_sample_index < block_end:
+            anchor_sample_index = self._next_anchor_sample_index
+            if anchor_sample_index >= block.sample_index:
+                sample_delta = anchor_sample_index - block.sample_index
+                anchor_pc_timestamp = block.pc_perf_timestamp + (float(sample_delta) / float(self.sample_rate))
+                writer.writerow([
+                    str(anchor_sample_index),
+                    f"{anchor_sample_index / float(self.sample_rate):.9f}",
+                    f"{anchor_pc_timestamp:.9f}",
+                    f"{block.callback_pc_perf_timestamp:.9f}",
+                    self._format_optional_float(block.pa_input_buffer_adc_time),
+                    self._format_optional_float(block.pa_current_time),
+                    self._format_optional_float(block.pc_clock_offset),
+                    str(block.sample_index),
+                    str(block.frames),
+                    block.status_flags,
+                    block.clock_source,
+                ])
+                self.anchors_written += 1
+            self._next_anchor_sample_index += self._anchor_interval_frames
+
+    def _write_metadata(self):
+        metadata = {
+            "device_index": self.device_index,
+            "device_name": self.device_name,
+            "sample_rate": self.sample_rate,
+            "channels": AUDIO_CHANNELS,
+            "dtype": AUDIO_DTYPE,
+            "sample_width_bytes": AUDIO_SAMPLE_WIDTH_BYTES,
+            "wav_file": self.wav_file,
+            "timestamp_file": self.timestamp_file,
+            "frames_captured": self.frames_captured,
+            "frames_written": self.frames_written,
+            "blocks_captured": self.blocks_captured,
+            "timestamp_anchors_written": self.anchors_written,
+            "anchor_interval_seconds": AUDIO_ANCHOR_INTERVAL_SECONDS,
+            "timing_method": "First and per-second sample-index anchors using time.perf_counter() / pc_perf_timestamp.",
+            "started_pc_perf_timestamp": self.started_pc_perf_timestamp,
+            "stopped_pc_perf_timestamp": self.stopped_pc_perf_timestamp,
+            "writer_error": str(self.error) if self.error else "",
+        }
+        try:
+            with open(self.metadata_file, "w") as fp:
+                json.dump(metadata, fp, indent=2)
+        except Exception as exc:
+            print(f"Audio metadata write failed: {exc}")
+
+    @staticmethod
+    def _time_attr(time_info, attr):
+        try:
+            value = getattr(time_info, attr)
+        except Exception:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _format_optional_float(value):
+        return "" if value is None else f"{float(value):.9f}"
+
+
 # ===================== CSV Writers =====================
-class SensorCSVWriterThread:
-    def __init__(self, output_file):
+class CSVWriterThread:
+    def __init__(self, output_file, column_names, row_formatter):
         self.output_file = output_file
+        self.column_names = column_names
+        self.row_formatter = row_formatter
         self.queue = queue.SimpleQueue()
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._write_loop, daemon=True)
-        self.packets_written = 0
-    def start(self): self._thread.start()
+        self.rows_written = 0
+        self.error = None
+
+    def start(self):
+        self._thread.start()
+
     def stop(self):
         self._stop_event.set()
         self._thread.join(timeout=2.0)
-    def push(self, values): self.queue.put(values)
+        if self._thread.is_alive():
+            self.error = self.error or "CSV writer did not finish flushing"
+        if self.error:
+            raise RuntimeError(self.error)
+
+    def push(self, sample):
+        self.queue.put(sample)
+
     def _write_loop(self):
-        with open(self.output_file, 'w', newline='') as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(SENSOR_COLUMN_NAMES)
-            while not self._stop_event.is_set() or not self.queue.empty():
-                try: values = self.queue.get(timeout=0.1)
-                except queue.Empty: continue
-                row = []
-                for i, v in enumerate(values):
-                    if i in (0, 1, 2, 13): row.append(str(int(v)))
-                    else: row.append(f'{v:.6f}')
-                writer.writerow(row)
-                self.packets_written += 1
+        try:
+            with open(self.output_file, "w", newline="") as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(self.column_names)
+                while not self._stop_event.is_set() or not self.queue.empty():
+                    try:
+                        sample = self.queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    writer.writerow(self.row_formatter(sample))
+                    self.rows_written += 1
+        except Exception as exc:
+            self.error = exc
 
-class EyeCSVWriterWorker(QtCore.QObject):
-    def __init__(self, queue_obj, output_file):
-        super().__init__()
-        self.queue = queue_obj
-        self.output_file = output_file
-        self._stop = False
-    def stop(self): self._stop = True
-    def run(self):
-        with open(self.output_file, "w", newline="") as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(EYE_COLUMN_NAMES)
-            while not self._stop or not self.queue.empty():
-                try: sample = self.queue.get(timeout=0.1)
-                except queue.Empty: continue
-                row = [
-                    f"{sample['pc_timestamp']:.6f}", str(int(sample["device_timestamp"])), f"{sample['gaze_x']:.6f}", f"{sample['gaze_y']:.6f}", f"{sample['gaze_z']:.6f}",
-                    f"{sample['left_pupil_x']:.6f}", f"{sample['left_pupil_y']:.6f}", f"{sample['right_pupil_x']:.6f}", f"{sample['right_pupil_y']:.6f}",
-                    f"{sample['left_pupil_diameter_mm']:.6f}", f"{sample['right_pupil_diameter_mm']:.6f}", f"{sample['left_openness']:.6f}", f"{sample['right_openness']:.6f}",
-                    str(int(sample["left_blink"])), str(int(sample["right_blink"])),
-                ]
-                writer.writerow(row)
 
-class EyeCSVWriterThread:
-    def __init__(self, output_file):
-        self.output_file = output_file
-        self.queue = queue.Queue()
-        self._thread = QtCore.QThread()
-        self._worker = EyeCSVWriterWorker(self.queue, self.output_file)
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-    def start(self): self._thread.start()
-    def stop(self):
-        self._worker.stop()
-        self._thread.quit()
-        self._thread.wait(2000)
-    def push(self, sample): self.queue.put(sample)
+def format_sensor_csv_row(sample):
+    return [
+        str(int(sample["red"])),
+        str(int(sample["ir"])),
+        str(int(sample["green"])),
+        f"{sample['ax']:.6f}",
+        f"{sample['ay']:.6f}",
+        f"{sample['az']:.6f}",
+        f"{sample['gx']:.6f}",
+        f"{sample['gy']:.6f}",
+        f"{sample['gz']:.6f}",
+        f"{sample['mx']:.6f}",
+        f"{sample['my']:.6f}",
+        f"{sample['mz']:.6f}",
+        f"{sample['temp']:.6f}",
+        f"{sample['device_timestamp_ms']:.3f}",
+        f"{sample['pc_arrival_timestamp']:.9f}",
+    ]
+
+
+def format_eye_csv_row(sample):
+    return [
+        str(int(sample["device_timestamp"])),
+        f"{sample['pc_arrival_timestamp']:.9f}",
+        f"{sample['gaze_x']:.6f}",
+        f"{sample['gaze_y']:.6f}",
+        f"{sample['gaze_z']:.6f}",
+        f"{sample['left_pupil_x']:.6f}",
+        f"{sample['left_pupil_y']:.6f}",
+        f"{sample['right_pupil_x']:.6f}",
+        f"{sample['right_pupil_y']:.6f}",
+        f"{sample['left_pupil_diameter_mm']:.6f}",
+        f"{sample['right_pupil_diameter_mm']:.6f}",
+        f"{sample['left_openness']:.6f}",
+        f"{sample['right_openness']:.6f}",
+        str(int(sample["left_blink"])),
+        str(int(sample["right_blink"])),
+    ]
 
 
 # ===================== UI Integrated Window =====================
 class IntegratedMonitorWindow(QtWidgets.QMainWindow):
     # Eye Tracker SDK Signals
     set_sdk_running_signal = QtCore.pyqtSignal(bool)
-    set_pupil_center_signal = QtCore.pyqtSignal(float, float, float, float)
-    set_gaze_signal = QtCore.pyqtSignal(float, float)
-    set_scene_image_signal = QtCore.pyqtSignal(QPixmap)
-    set_left_eye_image_signal = QtCore.pyqtSignal(QPixmap)
-    set_right_eye_image_signal = QtCore.pyqtSignal(QPixmap)
     set_calibration_finish_signal = QtCore.pyqtSignal(int, int, int)
 
     def __init__(self, args):
@@ -478,9 +745,6 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.calibration_root = os.fspath(SHARED_CALIBRATION_PROFILE_DIR)
         os.makedirs(self.log_dir, exist_ok=True)
         os.makedirs(self.calibration_root, exist_ok=True)
-
-        # Time syncing
-        self.ts_offset = 0.0
 
         # Data & Buffers
         self.sensor_rate_tracker = PacketRateTracker()
@@ -498,13 +762,17 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.last_metric_update_ms = 0.0
         self.last_range_update_ms = 0.0
         
-        self.sensor_invalid_count = 0
         self.sensor_latest_temp = None
 
         # Writers & Reader components
         self.sensor_csv_writer = None
         self.eye_csv_writer = None
+        self.audio_recorder = None
         self.sensor_reader = None
+        self._preview_lock = threading.Lock()
+        self._pending_scene_frame = None
+        self._pending_left_eye_frame = None
+        self._pending_right_eye_frame = None
 
         # Eye tracker Component
         self.eye_sdk = wrapper()
@@ -608,6 +876,22 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         lo_sensor.addWidget(QtWidgets.QLabel("Port:")); lo_sensor.addWidget(self.combo_port)
         lo_sensor.addWidget(QtWidgets.QLabel("Baudrate:")); lo_sensor.addWidget(self.combo_baud)
         sidebar.addWidget(grp_sensor)
+
+        # Audio Settings
+        grp_audio = QtWidgets.QGroupBox("Audio Recording")
+        grp_audio.setStyleSheet(group_ss)
+        grp_audio.setFixedWidth(sidebar_width)
+        lo_audio = QtWidgets.QVBoxLayout(grp_audio)
+        self.combo_audio_device = AudioDeviceComboBox()
+        self.combo_audio_device.setStyleSheet(combo_ss)
+        self.combo_audio_rate = QtWidgets.QComboBox()
+        self.combo_audio_rate.setStyleSheet(combo_ss)
+        self.combo_audio_device.popup_requested.connect(self._populate_audio_devices)
+        self.combo_audio_device.currentIndexChanged.connect(self._populate_audio_sample_rates)
+        lo_audio.addWidget(QtWidgets.QLabel("Microphone:")); lo_audio.addWidget(self.combo_audio_device)
+        lo_audio.addWidget(QtWidgets.QLabel("Sample Rate:")); lo_audio.addWidget(self.combo_audio_rate)
+        sidebar.addWidget(grp_audio)
+        self._populate_audio_devices()
 
         # Eye tracker Settings
         grp_eye = QtWidgets.QGroupBox("Eye Tracker Setup")
@@ -717,9 +1001,21 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.labelRightEye.setMaximumWidth(220)
         self.labelRightEye.setStyleSheet(f"background:{t['value_bg']}; border: 1px solid {t['group_border']}; border-radius: 4px;")
         self.labelRightEye.setAlignment(Qt.AlignCenter)
+        self.audio_loudness_bar = QtWidgets.QProgressBar()
+        self.audio_loudness_bar.setRange(0, 100)
+        self.audio_loudness_bar.setValue(0)
+        self.audio_loudness_bar.setTextVisible(True)
+        self.audio_loudness_bar.setFormat("Mic: -- dBFS")
+        self.audio_loudness_bar.setFixedHeight(18)
+        self.audio_loudness_bar.setMaximumWidth(220)
+        self.audio_loudness_bar.setStyleSheet(
+            f"QProgressBar {{ background: {t['value_bg']}; color: {t['fg']}; border: 1px solid {t['group_border']}; border-radius: 4px; text-align: center; font-size: 11px; }}"
+            f"QProgressBar::chunk {{ background: {t['value_fg']}; border-radius: 3px; }}"
+        )
         
         lyt_left_eye = QtWidgets.QVBoxLayout(); lyt_left_eye.addWidget(QtWidgets.QLabel("Left Eye"), alignment=Qt.AlignCenter); lyt_left_eye.addWidget(self.labelLeftEye)
         lyt_right_eye = QtWidgets.QVBoxLayout(); lyt_right_eye.addWidget(QtWidgets.QLabel("Right Eye"), alignment=Qt.AlignCenter); lyt_right_eye.addWidget(self.labelRightEye)
+        lyt_right_eye.addWidget(self.audio_loudness_bar)
         
         eyes_col.addLayout(lyt_left_eye)
         eyes_col.addLayout(lyt_right_eye)
@@ -839,6 +1135,227 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         )
         return any(target in (field or "").casefold() for field in fields)
 
+    def _populate_audio_devices(self):
+        current_device = self.combo_audio_device.currentData()
+        self.combo_audio_device.blockSignals(True)
+        self.combo_audio_device.clear()
+
+        if sd is None:
+            self.combo_audio_device.addItem("sounddevice not installed", None)
+            self.combo_audio_device.blockSignals(False)
+            self._populate_audio_sample_rates()
+            self._set_audio_controls_enabled(False)
+            return
+
+        try:
+            devices = sd.query_devices()
+            hostapis = sd.query_hostapis()
+        except Exception as exc:
+            self.combo_audio_device.addItem(f"Audio query failed: {exc}", None)
+            self.combo_audio_device.blockSignals(False)
+            self._populate_audio_sample_rates()
+            self._set_audio_controls_enabled(False)
+            return
+
+        input_devices = self._filtered_audio_input_devices(devices, hostapis)
+        for item in input_devices:
+            self.combo_audio_device.addItem(item["label"], item["index"])
+
+        if not input_devices:
+            self.combo_audio_device.addItem("No input devices found", None)
+        else:
+            preferred_device = current_device
+            if preferred_device is None:
+                preferred_device = self._default_audio_input_device()
+            preferred_index = self.combo_audio_device.findData(preferred_device)
+            if preferred_index >= 0:
+                self.combo_audio_device.setCurrentIndex(preferred_index)
+            else:
+                self.combo_audio_device.setCurrentIndex(0)
+
+        self.combo_audio_device.blockSignals(False)
+        self._populate_audio_sample_rates()
+        self._set_audio_controls_enabled(not self.system_running)
+
+    def _filtered_audio_input_devices(self, devices, hostapis):
+        rows = []
+        default_device = self._default_audio_input_device()
+        default_key = None
+        if default_device is not None and 0 <= default_device < len(devices):
+            default_key = self._audio_device_dedupe_key(
+                self._audio_display_name(str(devices[default_device].get("name", "")))
+            )
+
+        for index, device in enumerate(devices):
+            try:
+                input_channels = int(device.get("max_input_channels", 0))
+            except Exception:
+                input_channels = 0
+            if input_channels <= 0:
+                continue
+
+            raw_name = str(device.get("name", "Unknown microphone")).strip()
+            hostapi_name = self._audio_hostapi_name(device, hostapis)
+            raw_name_lower = raw_name.casefold()
+            if "loopback" in raw_name_lower:
+                continue
+
+            rows.append({
+                "index": int(index),
+                "raw_name": raw_name,
+                "display_name": self._audio_display_name(raw_name),
+                "hostapi_name": hostapi_name,
+                "input_channels": input_channels,
+                "default_samplerate": float(device.get("default_samplerate", 0.0) or 0.0),
+                "is_default": default_device == int(index),
+                "is_wasapi": "wasapi" in hostapi_name.casefold(),
+                "is_windows_api": any(token in hostapi_name.casefold() for token in ("wasapi", "mme", "directsound")),
+            })
+            if default_key and self._audio_device_dedupe_key(rows[-1]["display_name"]) == default_key:
+                rows[-1]["is_default"] = True
+
+        windows_rows = [row for row in rows if row["is_windows_api"]]
+        if windows_rows:
+            rows = windows_rows
+
+        wasapi_rows = [row for row in rows if row["is_wasapi"]]
+        if wasapi_rows:
+            rows = wasapi_rows
+
+        deduped = {}
+        for row in rows:
+            key = self._audio_device_dedupe_key(row["display_name"])
+            existing = deduped.get(key)
+            if existing is None or self._audio_device_sort_key(row) < self._audio_device_sort_key(existing):
+                deduped[key] = row
+
+        result = sorted(deduped.values(), key=lambda row: (not row["is_default"], row["display_name"].casefold()))
+        for row in result:
+            label = row["display_name"]
+            if row["is_default"]:
+                label += " (Default)"
+            row["label"] = label
+        return result
+
+    def _audio_hostapi_name(self, device, hostapis):
+        try:
+            return str(hostapis[int(device.get("hostapi", -1))].get("name", ""))
+        except Exception:
+            return ""
+
+    def _audio_display_name(self, raw_name):
+        name = raw_name.strip()
+        for suffix in (" (WASAPI)", " (Windows WASAPI)", " (DirectSound)", " (MME)"):
+            if name.endswith(suffix):
+                name = name[:-len(suffix)].strip()
+        if name.casefold().startswith("microphone array ("):
+            return "Microphone Array " + name[len("microphone array "):]
+        return name
+
+    def _audio_device_dedupe_key(self, display_name):
+        key = display_name.casefold()
+        for token in ("default - ", "communications - "):
+            if key.startswith(token):
+                key = key[len(token):]
+        return " ".join(key.replace("_", " ").split())
+
+    def _audio_device_sort_key(self, row):
+        return (
+            not row["is_default"],
+            not row["is_wasapi"],
+            -row["input_channels"],
+            row["display_name"].casefold(),
+            row["index"],
+        )
+
+    def _populate_audio_sample_rates(self, _index=None):
+        if not hasattr(self, "combo_audio_rate"):
+            return
+
+        current_rate = self.combo_audio_rate.currentData()
+        selected_device = self.combo_audio_device.currentData() if hasattr(self, "combo_audio_device") else None
+        self.combo_audio_rate.blockSignals(True)
+        self.combo_audio_rate.clear()
+
+        if sd is None:
+            self.combo_audio_rate.addItem("Unavailable", None)
+            self.combo_audio_rate.blockSignals(False)
+            self._set_audio_controls_enabled(False)
+            return
+
+        if selected_device is None:
+            self.combo_audio_rate.addItem("No microphone", None)
+            self.combo_audio_rate.blockSignals(False)
+            self._set_audio_controls_enabled(False)
+            return
+
+        supported_rates = self._supported_audio_sample_rates(int(selected_device))
+        if not supported_rates:
+            self.combo_audio_rate.addItem("No supported rates", None)
+            self.combo_audio_rate.blockSignals(False)
+            self._set_audio_controls_enabled(False)
+            return
+
+        for rate in supported_rates:
+            self.combo_audio_rate.addItem(f"{rate} Hz", int(rate))
+
+        preferred_rate = current_rate or int(self.args.audio_sample_rate)
+        if self.combo_audio_rate.findData(preferred_rate) < 0:
+            preferred_rate = int(self.args.audio_sample_rate)
+        if self.combo_audio_rate.findData(preferred_rate) < 0:
+            preferred_rate = 48000
+        preferred_index = self.combo_audio_rate.findData(preferred_rate)
+        if preferred_index < 0:
+            preferred_index = 0
+        self.combo_audio_rate.setCurrentIndex(preferred_index)
+        self.combo_audio_rate.blockSignals(False)
+        self._set_audio_controls_enabled(not self.system_running)
+
+    def _supported_audio_sample_rates(self, device_index):
+        try:
+            device_info = sd.query_devices(device_index)
+            default_rate = int(round(float(device_info.get("default_samplerate", 0))))
+        except Exception:
+            default_rate = 0
+
+        candidate_rates = set(AUDIO_SAMPLE_RATE_OPTIONS)
+        if default_rate > 0:
+            candidate_rates.add(default_rate)
+
+        supported_rates = []
+        for rate in sorted(candidate_rates):
+            try:
+                sd.check_input_settings(
+                    device=device_index,
+                    channels=AUDIO_CHANNELS,
+                    samplerate=int(rate),
+                    dtype=AUDIO_DTYPE,
+                )
+            except Exception:
+                continue
+            supported_rates.append(int(rate))
+        return supported_rates
+
+    def _default_audio_input_device(self):
+        try:
+            default_device = sd.default.device
+            if isinstance(default_device, (tuple, list)):
+                default_input = int(default_device[0])
+            else:
+                default_input = int(default_device)
+            return default_input if default_input >= 0 else None
+        except Exception:
+            return None
+
+    def _set_audio_controls_enabled(self, enabled):
+        dependency_ok = sd is not None
+        device_ok = hasattr(self, "combo_audio_device") and self.combo_audio_device.currentData() is not None
+        rate_ok = hasattr(self, "combo_audio_rate") and self.combo_audio_rate.currentData() is not None
+        if hasattr(self, "combo_audio_device"):
+            self.combo_audio_device.setEnabled(enabled and dependency_ok and device_ok)
+        if hasattr(self, "combo_audio_rate"):
+            self.combo_audio_rate.setEnabled(enabled and dependency_ok and device_ok and rate_ok)
+
     def _sanitize_profile_name(self, value):
         cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_", " ") else "_" for ch in value).strip()
         return cleaned or datetime.now().strftime("profile_%Y%m%d_%H%M%S")
@@ -929,14 +1446,79 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.combo_calibration_profile.editTextChanged.connect(self._update_calibration_profile_controls)
 
         self.set_sdk_running_signal.connect(self._on_set_sdk_running)
-        self.set_pupil_center_signal.connect(self._display_pupil_data)
-        self.set_gaze_signal.connect(self._display_gaze_data)
-        self.set_scene_image_signal.connect(self._display_scene_image)
-        self.set_left_eye_image_signal.connect(self._display_left_eye_image)
-        self.set_right_eye_image_signal.connect(self._display_right_eye_image)
         self.set_calibration_finish_signal.connect(self._on_set_calibration_finish)
 
     # ---- Eye Tracker Callbacks ----
+    def wants_preview_frame(self, eye):
+        with self._preview_lock:
+            if eye == 13:
+                return self._pending_scene_frame is None
+            if eye == 1:
+                return self._pending_left_eye_frame is None
+            if eye == 2:
+                return self._pending_right_eye_frame is None
+        return False
+
+    def handle_scene_frame(self, frame_bytes, size, width, height, device_timestamp, pc_arrival_timestamp):
+        with self._preview_lock:
+            self._pending_scene_frame = (
+                bytes(frame_bytes),
+                int(size),
+                int(width),
+                int(height),
+                int(device_timestamp),
+                float(pc_arrival_timestamp),
+            )
+
+    def handle_eye_preview_frame(self, eye, frame_bytes, width, height, device_timestamp, pc_arrival_timestamp):
+        frame = (
+            bytes(frame_bytes),
+            int(width),
+            int(height),
+            int(device_timestamp),
+            float(pc_arrival_timestamp),
+        )
+        with self._preview_lock:
+            if eye == 1:
+                self._pending_left_eye_frame = frame
+            elif eye == 2:
+                self._pending_right_eye_frame = frame
+
+    def _process_preview_frames(self):
+        with self._preview_lock:
+            scene_frame = self._pending_scene_frame
+            left_frame = self._pending_left_eye_frame
+            right_frame = self._pending_right_eye_frame
+            self._pending_scene_frame = None
+            self._pending_left_eye_frame = None
+            self._pending_right_eye_frame = None
+
+        if scene_frame:
+            self._display_scene_frame(*scene_frame)
+        if left_frame:
+            self._display_eye_preview_frame(self.labelLeftEye, left_frame)
+        if right_frame:
+            self._display_eye_preview_frame(self.labelRightEye, right_frame)
+
+    def _display_scene_frame(self, frame_bytes, size, width, height, _device_timestamp, _pc_arrival_timestamp):
+        try:
+            encoded = ctypes.create_string_buffer(frame_bytes)
+            ptr = ctypes.cast(encoded, ctypes.c_void_p)
+            self.eye_sdk.h256_dll_handle._7i_h265_decode(int(size), ptr, self.eye_sdk.scene_img_buf.data, self.eye_sdk.scene_img_size_max)
+            image = QPixmap.fromImage(QImage(self.eye_sdk.scene_img_buf.data, int(width), int(height), QImage.Format_BGR888))
+            self._display_scene_image(image)
+        except Exception as exc:
+            print(f"Scene preview update failed: {exc}")
+
+    def _display_eye_preview_frame(self, label, frame):
+        frame_bytes, width, height, _device_timestamp, _pc_arrival_timestamp = frame
+        try:
+            image = QImage(frame_bytes, int(width), int(height), QImage.Format_Indexed8)
+            pixmap = QPixmap.fromImage(image.scaled(160, 120, Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
+            label.setPixmap(pixmap)
+        except Exception as exc:
+            print(f"Eye preview update failed: {exc}")
+
     def _display_scene_image(self, image):
         painter = QPainter(image)
         painter.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
@@ -946,12 +1528,6 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         painter.drawEllipse(rect)
         self.labelSceneImage.setPixmap(image)
     
-    def _display_left_eye_image(self, image):
-        self.labelLeftEye.setPixmap(image)
-
-    def _display_right_eye_image(self, image):
-        self.labelRightEye.setPixmap(image)
-
     def _display_pupil_data(self, lx, ly, rx, ry):
         self.lbl_pupil_x.setText(f"{lx:.5f}"); self.lbl_pupil_y.setText(f"{rx:.5f}")
 
@@ -967,6 +1543,10 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self._update_calibration_profile_controls()
         if not enabled:
             self.calibration_is_running = False
+            with self._preview_lock:
+                self._pending_scene_frame = None
+                self._pending_left_eye_frame = None
+                self._pending_right_eye_frame = None
             self.labelSceneImage.setPixmap(QPixmap())
             self.labelLeftEye.setPixmap(QPixmap())
             self.labelRightEye.setPixmap(QPixmap())
@@ -1026,62 +1606,156 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         cf.read(os.path.join(self.eye_sdk_config_path, "config.ini"))
         return cf.get("softdog", "pwd", fallback="").encode("utf-8")
 
+    def _start_audio_recording(self, ts_str):
+        if sd is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Warning",
+                f"Audio recording requires the 'sounddevice' package.\nImport error: {SOUNDDEVICE_IMPORT_ERROR}",
+            )
+            return False
+
+        device_index = self.combo_audio_device.currentData()
+        sample_rate = self.combo_audio_rate.currentData()
+        if device_index is None:
+            QtWidgets.QMessageBox.warning(self, "Warning", "No microphone input device is selected.")
+            return False
+        if sample_rate is None:
+            QtWidgets.QMessageBox.warning(self, "Warning", "No supported audio sample rate is selected.")
+            return False
+
+        wav_file = os.path.join(self.log_dir, f"audio_{ts_str}.wav")
+        timestamp_file = os.path.join(self.log_dir, f"audio_{ts_str}_timestamps.csv")
+        metadata_file = os.path.join(self.log_dir, f"audio_{ts_str}_metadata.json")
+        recorder = AudioRecorder(
+            device_index=device_index,
+            device_name=self.combo_audio_device.currentText(),
+            sample_rate=int(sample_rate),
+            wav_file=wav_file,
+            timestamp_file=timestamp_file,
+            metadata_file=metadata_file,
+        )
+
+        try:
+            recorder.start()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Warning", f"Audio recording failed to start:\n{exc}")
+            return False
+
+        self.audio_recorder = recorder
+        self._set_audio_controls_enabled(False)
+        return True
+
+    def _stop_audio_recording(self):
+        recorder = self.audio_recorder
+        self.audio_recorder = None
+        if recorder is None:
+            self._set_audio_controls_enabled(True)
+            return None
+
+        try:
+            recorder.stop()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Warning", f"Audio recording did not stop cleanly:\n{exc}")
+        finally:
+            self._set_audio_controls_enabled(True)
+        return recorder
+
     def _on_start_all(self):
-        self.system_running = True
+        if self.system_running:
+            return
         self.btn_start.setEnabled(False)
         self._populate_sensor_ports()
+        self._populate_audio_devices()
         self.sensor_reader = None
         self.eye_sdk_running = False
-        
+        self.audio_recorder = None
+
         # Prepare Logging Dirs
         ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        # Start Sensor
-        selected_port = self.combo_port.currentData()
-        if not selected_port:
-            QtWidgets.QMessageBox.warning(self, "Warning", f"No '{TARGET_SERIAL_DESCRIPTION}' serial port found.")
-        else:
-            self.sensor_reader = SerialPacketReader(selected_port, int(self.combo_baud.currentText()))
-        if self.sensor_reader and self.sensor_reader.open():
-            time.sleep(SERIAL_STARTUP_SETTLE_SECONDS)
-            self.sensor_reader.serial_port.reset_input_buffer()
-            self.sensor_reader.serial_port.reset_output_buffer()
-            self.ts_offset = sync_timestamps(self.sensor_reader.serial_port, rounds=20)
-            self.sensor_csv_writer = SensorCSVWriterThread(os.path.join(self.log_dir, f"sensor_{ts_str}.csv"))
-            self.sensor_csv_writer.start()
-            if self.sensor_reader.start():
-                time.sleep(0.3)
-                self.sensor_reader.send_command("s\n")
+        try:
+            # Prepare sensor before active recording begins.
+            selected_port = self.combo_port.currentData()
+            if not selected_port:
+                QtWidgets.QMessageBox.warning(self, "Warning", f"No '{TARGET_SERIAL_DESCRIPTION}' serial port found.")
             else:
-                self.sensor_csv_writer.stop()
-                self.sensor_csv_writer = None
-                self.sensor_reader.stop()
-                self.sensor_reader = None
-                QtWidgets.QMessageBox.warning(self, "Warning", "Sensor reader thread failed to start.")
-        elif selected_port:
-            QtWidgets.QMessageBox.warning(self, "Warning", "Sensor failed to connect.")
+                self.sensor_reader = SerialPacketReader(selected_port, int(self.combo_baud.currentText()))
+            if self.sensor_reader and self.sensor_reader.open():
+                self.sensor_reader.serial_port.reset_input_buffer()
+                self.sensor_reader.serial_port.reset_output_buffer()
+                self.sensor_csv_writer = CSVWriterThread(
+                    os.path.join(self.log_dir, f"sensor_{ts_str}.csv"),
+                    SENSOR_COLUMN_NAMES,
+                    format_sensor_csv_row,
+                )
+                self.sensor_csv_writer.start()
+                if self.sensor_reader.start():
+                    pass
+                else:
+                    self.sensor_csv_writer.stop()
+                    self.sensor_csv_writer = None
+                    self.sensor_reader.stop()
+                    self.sensor_reader = None
+                    QtWidgets.QMessageBox.warning(self, "Warning", "Sensor reader thread failed to start.")
+            elif selected_port:
+                QtWidgets.QMessageBox.warning(self, "Warning", "Sensor failed to connect.")
 
-        # Start Eye Tracker
-        pwd = self._read_pwd()
-        if self.eye_sdk.connect_softdog(pwd) == 0:
-            env = self.combo_env.currentData()
-            res = self.combo_res.currentData()
-            self.scene_width, self.scene_height = (1280, 960) if res == 201 else (1280, 720) if res == 202 else (800, 600) if res == 203 else (1920, 1080)
-            
-            if self.eye_sdk.start(env, res, self.scene_width, self.scene_height) == 0:
-                self._on_set_sdk_running(True)
-                self._load_selected_calibration_profile(show_message=False)
-                self.eye_csv_writer = EyeCSVWriterThread(os.path.join(self.log_dir, f"eye_{ts_str}.csv"))
-                self.eye_csv_writer.start()
+            if not self._start_audio_recording(ts_str):
+                self._cleanup_start_failure()
+                return
+
+            self.system_running = True
+            if self.sensor_reader:
+                self.sensor_reader.send_command("s\n")
+
+            # Start Eye Tracker
+            pwd = self._read_pwd()
+            if self.eye_sdk.connect_softdog(pwd) == 0:
+                env = self.combo_env.currentData()
+                res = self.combo_res.currentData()
+                self.scene_width, self.scene_height = (1280, 960) if res == 201 else (1280, 720) if res == 202 else (800, 600) if res == 203 else (1920, 1080)
+
+                if self.eye_sdk.start(env, res, self.scene_width, self.scene_height) == 0:
+                    self._on_set_sdk_running(True)
+                    self._load_selected_calibration_profile(show_message=False)
+                    self.eye_csv_writer = CSVWriterThread(
+                        os.path.join(self.log_dir, f"eye_{ts_str}.csv"),
+                        EYE_COLUMN_NAMES,
+                        format_eye_csv_row,
+                    )
+                    self.eye_csv_writer.start()
+                else:
+                    self._on_set_sdk_running(False)
+                    QtWidgets.QMessageBox.warning(self, "Warning", "Eye tracker start failed.")
             else:
                 self._on_set_sdk_running(False)
-                QtWidgets.QMessageBox.warning(self, "Warning", "Eye tracker start failed.")
-        else:
-            self._on_set_sdk_running(False)
-            QtWidgets.QMessageBox.warning(self, "Warning", "Eye tracker dog connect failed.")
+                QtWidgets.QMessageBox.warning(self, "Warning", "Eye tracker dog connect failed.")
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to start logging session:\n{exc}")
+            self._on_stop_all()
+            return
 
         self.btn_stop.setEnabled(True)
         self.timer.start(PLOT_UPDATE_INTERVAL_MS)
+
+    def _cleanup_start_failure(self):
+        if self.sensor_reader:
+            try:
+                self.sensor_reader.stop()
+            except Exception as exc:
+                print(f"Sensor reader cleanup failed: {exc}")
+            self.sensor_reader = None
+        if self.sensor_csv_writer:
+            try:
+                self.sensor_csv_writer.stop()
+            except Exception as exc:
+                print(f"Sensor CSV writer cleanup failed: {exc}")
+            self.sensor_csv_writer = None
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.system_running = False
+        self._set_audio_controls_enabled(True)
 
     def _on_stop_all(self):
         self.system_running = False
@@ -1092,55 +1766,82 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.btn_cal_stop.setEnabled(False)
         self._update_calibration_profile_controls()
 
+        sensor_writer = self.sensor_csv_writer
+        eye_writer = self.eye_csv_writer
+
         # Stop Sensor
         if self.sensor_reader:
             try:
                 self.sensor_reader.send_command("e\n")
-                time.sleep(0.3)
             except Exception:
                 pass
-            self.sensor_reader.stop()
+            try:
+                self.sensor_reader.stop()
+            except Exception as exc:
+                print(f"Sensor reader stop failed: {exc}")
             self.sensor_reader = None
         if self.sensor_csv_writer:
-            self.sensor_csv_writer.stop()
+            try:
+                self.sensor_csv_writer.stop()
+            except Exception as exc:
+                print(f"Sensor CSV writer stop failed: {exc}")
             self.sensor_csv_writer = None
         
         # Stop Eye
-        if self.calibration_is_running: self._on_stop_calibration()
-        self.eye_sdk.stop()
-        if self.eye_csv_writer: self.eye_csv_writer.stop()
+        if self.calibration_is_running:
+            try:
+                self._on_stop_calibration()
+            except Exception as exc:
+                print(f"Calibration stop failed: {exc}")
+        try:
+            self.eye_sdk.stop()
+        except Exception as exc:
+            print(f"Eye tracker stop failed: {exc}")
+        if self.eye_csv_writer:
+            try:
+                self.eye_csv_writer.stop()
+            except Exception as exc:
+                print(f"Eye CSV writer stop failed: {exc}")
         self.eye_sdk_running = False
         self.eye_csv_writer = None
+
+        # Stop Audio last so the WAV covers the full shutdown boundary.
+        audio_recorder = self._stop_audio_recording()
         
         print("\n===== Logging Session Summary =====")
         print(f"Sensor Total Packets:    {self.sensor_rate_tracker.total_packets}")
-        if self.sensor_csv_writer:
-            print(f"Sensor Log Output:       {self.sensor_csv_writer.output_file}")
+        if sensor_writer:
+            print(f"Sensor Log Output:       {sensor_writer.output_file}")
         print(f"Eye Tracker Data Frames: {self.eye_packet_count}")
-        if self.eye_csv_writer:
-            print(f"Eye Tracker Log Output:  {self.eye_csv_writer.output_file}")
+        if eye_writer:
+            print(f"Eye Tracker Log Output:  {eye_writer.output_file}")
+        if audio_recorder:
+            print(f"Audio Frames Written:    {audio_recorder.frames_written}")
+            print(f"Audio WAV Output:        {audio_recorder.wav_file}")
+            print(f"Audio Timestamp Output:  {audio_recorder.timestamp_file}")
+            print(f"Audio Metadata Output:   {audio_recorder.metadata_file}")
         print("===================================\n")
 
     # ---- Timer Update ----
     def _on_timer(self):
         now_ms = time.perf_counter() * 1000
+        self._process_preview_frames()
+
         # Drain Sensor
         if self.sensor_reader:
             red_b, ir_b, green_b, ax_b, ay_b, az_b, gx_b, gy_b, gz_b, mx_b, my_b, mz_b = ([] for _ in range(12))
             while True:
                 try: p = self.sensor_reader.packet_queue.get_nowait()
                 except queue.Empty: break
-                
-                self.sensor_rate_tracker.push(p["timestamp"])
+
+                self.sensor_rate_tracker.push(p["pc_arrival_timestamp"])
                 red_b.append(p["red"]); ir_b.append(p["ir"]); green_b.append(p["green"])
                 ax_b.append(p["ax"]); ay_b.append(p["ay"]); az_b.append(p["az"])
                 gx_b.append(p["gx"]); gy_b.append(p["gy"]); gz_b.append(p["gz"])
                 mx_b.append(p["mx"]); my_b.append(p["my"]); mz_b.append(p["mz"])
                 self.sensor_latest_temp = p["temp"]
                 if self.sensor_csv_writer:
-                    pc_ts = p["timestamp_ms"]/1000.0 + self.ts_offset
-                    self.sensor_csv_writer.push([p["red"], p["ir"], p["green"], p["ax"], p["ay"], p["az"],
-                                                 p["gx"], p["gy"], p["gz"], p["mx"], p["my"], p["mz"], p["temp"], p["timestamp_ms"], pc_ts])
+                    self.sensor_csv_writer.push(p)
             if red_b:
                 self.sensor_buffers.red.append(red_b); self.sensor_buffers.ir.append(ir_b); self.sensor_buffers.green.append(green_b)
                 self.sensor_buffers.ax.append(ax_b); self.sensor_buffers.ay.append(ay_b); self.sensor_buffers.az.append(az_b)
@@ -1149,16 +1850,26 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
 
         # Drain Eye
         if self.eye_sdk_running:
+            last_eye_sample = None
             while True:
                 try: s = self.eye_sdk.data_queue.get_nowait()
                 except queue.Empty: break
-                self.eye_rate_tracker.push(s["perf_timestamp"])
+                self.eye_rate_tracker.push(s["pc_arrival_timestamp"])
                 self.eye_packet_count += 1
+                last_eye_sample = s
                 self.eye_gaze_x_series.append([s["gaze_x"]])
                 self.eye_gaze_y_series.append([s["gaze_y"]])
                 self.eye_left_pupil_series.append([s["left_pupil_diameter_mm"]])
                 self.eye_right_pupil_series.append([s["right_pupil_diameter_mm"]])
                 if self.eye_csv_writer: self.eye_csv_writer.push(s)
+            if last_eye_sample:
+                self._display_gaze_data(last_eye_sample["gaze_x"], last_eye_sample["gaze_y"])
+                self._display_pupil_data(
+                    last_eye_sample["left_pupil_x"],
+                    last_eye_sample["left_pupil_y"],
+                    last_eye_sample["right_pupil_x"],
+                    last_eye_sample["right_pupil_y"],
+                )
 
         # Plot update
         if now_ms - self.last_plot_update_ms >= PLOT_UPDATE_INTERVAL_MS:
@@ -1228,6 +1939,25 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.lbl_sensor_temp.setText(f"Sen Temp: {tval:.2f}" if tval and tval == tval else "Sen Temp: --")
         self.lbl_eye_rate.setText(f"Eye Rate: {self.eye_rate_tracker.current_rate():.1f} Hz")
         self.lbl_eye_packets.setText(f"Eye Pkts: {self.eye_packet_count}")
+        self._update_audio_loudness()
+
+    def _update_audio_loudness(self):
+        if not hasattr(self, "audio_loudness_bar"):
+            return
+
+        if not self.audio_recorder:
+            self.audio_loudness_bar.setValue(0)
+            self.audio_loudness_bar.setFormat("Mic: -- dBFS")
+            return
+
+        level, dbfs, timestamp = self.audio_recorder.latest_loudness()
+        if dbfs is None or timestamp is None or time.perf_counter() - timestamp > 1.0:
+            self.audio_loudness_bar.setValue(0)
+            self.audio_loudness_bar.setFormat("Mic: -- dBFS")
+            return
+
+        self.audio_loudness_bar.setValue(level)
+        self.audio_loudness_bar.setFormat(f"Mic: {dbfs:.1f} dBFS")
 
     def closeEvent(self, event):
         if self.system_running: self._on_stop_all()
@@ -1241,6 +1971,7 @@ def parse_args():
     parser.add_argument("--baud", type=int, default=1000000)
     parser.add_argument("--sensor-sample-rate", type=float, default=250.0)
     parser.add_argument("--eye-sample-rate", type=float, default=120.0)
+    parser.add_argument("--audio-sample-rate", type=int, default=48000)
     parser.add_argument("--window-seconds", type=float, default=DISPLAY_WINDOW_SECONDS)
     return parser.parse_args()
 
