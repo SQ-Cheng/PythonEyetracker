@@ -34,6 +34,12 @@ wheels/
 # SDK specifics
 example/test_stdout.txt
 example/test_stderr.txt
+calibration_profiles/
+PythonScript/calibration_profiles/
+PythonScript/test_stdout.txt
+PythonScript/test_stderr.txt
+aSeeX.log
+PythonScript/aSeeX.log
 
 # Documentation / Reference (Exclude from git as requested)
 眼动仪参考资料/

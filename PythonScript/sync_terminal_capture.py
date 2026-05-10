@@ -459,7 +459,7 @@ class SyncCaptureSession:
         print(f"Capture saved to: {self.output_dir}")
         print(f"Sensor rows: {self.sensor_writer.rows_written}")
         print(f"Right-eye rows: {self.eye_writer.rows_written}")
-        print("Review with: python example/sync_capture_review.py")
+        print("Review with: python sync_capture_review.py")
 
 
 def parse_args():

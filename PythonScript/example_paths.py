@@ -8,8 +8,8 @@ import os
 SDK_ROOT_ENV_VAR = "ASEE_GLASSES_SDK_ROOT"
 DEFAULT_VENDOR_SDK_ROOT = Path(r"E:/7invensun/aSeeGlassesPlusUserSDK")
 
-EXAMPLE_DIR = Path(__file__).resolve().parent
-SDK_PROJECT_ROOT = EXAMPLE_DIR.parent
+SCRIPT_DIR = Path(__file__).resolve().parent
+SDK_PROJECT_ROOT = SCRIPT_DIR
 LOG_DIR = SDK_PROJECT_ROOT / "log"
 CALIBRATION_PROFILE_DIR = SDK_PROJECT_ROOT / "calibration_profiles"
 
