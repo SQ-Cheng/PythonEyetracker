@@ -1,0 +1,22 @@
+{
+  "port": "COM10",
+  "configuration": "softdevice=s132v6,debug=l0,debug_output=serial",
+  "output": "build",
+  "board": "adafruit:nrf52:feather52832",
+  "programmer": "nrfjprog",
+  "useProgrammer": false,
+  "optimize_for_debug": false,
+  "configurationRequired": true,
+  "compile_profile": "",
+  "monitorPortSettings": {
+    "settings": {
+      "port": "COM10",
+      "baudRate": 115200,
+      "lineEnding": "\r\n",
+      "dataBits": 8,
+      "parity": "none",
+      "stopBits": "one"
+    },
+    "profile_name": ""
+  }
+}
