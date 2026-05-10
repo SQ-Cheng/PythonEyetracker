@@ -1,7 +1,43 @@
+# Logs and temporary files
 log/
-calibration_profiles/
+**/log/
+*.log
+*.zip
+*.rar
+*.7z
+tmp/
+temp/
+
+# Python
 __pycache__/
 *.py[cod]
-*.log
+*.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# SDK specifics
 example/test_stdout.txt
 example/test_stderr.txt
+
+# Documentation / Reference (Exclude from git as requested)
+眼动仪参考资料/
+TrackerLog/
+
+# Build artifacts
+sensor_integrated/build/
