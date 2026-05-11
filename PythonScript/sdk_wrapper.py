@@ -88,6 +88,7 @@ class wrapper:
         self = context
         pc_arrival_timestamp = time.perf_counter()
         obj = eyes.__getitem__(0)
+        gyro_data = obj.gyro
 
         sample = {
             "pc_arrival_timestamp": pc_arrival_timestamp,
@@ -105,6 +106,10 @@ class wrapper:
             "right_blink": int(obj.right_ex_data.blink),
             "left_openness": float(obj.left_ex_data.openness),
             "right_openness": float(obj.right_ex_data.openness),
+            "gyro_timestamp": int(gyro_data.timestamp),
+            "gyro_x": float(gyro_data.gyro[0]),
+            "gyro_y": float(gyro_data.gyro[1]),
+            "gyro_z": float(gyro_data.gyro[2]),
         }
         try:
             self.data_queue.put(sample)
@@ -178,7 +183,7 @@ class wrapper:
         ret = self.h256_dll_handle._7i_h265_init(img_width, img_height)
         print('_7i_h265_init:%d' % ret)
 
-        enable_gyroscope = 0
+        enable_gyroscope = 1
         print('sdk config path:%s' % self.sdk_config_path)
         ret = self.sdk_dll_handle._7i_start(self.sdk_config_path, environment, resolution, enable_gyroscope)
         print('_7i_start:%d' % ret)

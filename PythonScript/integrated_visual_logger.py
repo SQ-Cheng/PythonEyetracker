@@ -74,7 +74,8 @@ EYE_COLUMN_NAMES = [
     "device_timestamp", "pc_arrival_timestamp", "gaze_x", "gaze_y", "gaze_z",
     "left_pupil_x", "left_pupil_y", "right_pupil_x", "right_pupil_y",
     "left_pupil_diameter_mm", "right_pupil_diameter_mm",
-    "left_openness", "right_openness", "left_blink", "right_blink"
+    "left_openness", "right_openness", "left_blink", "right_blink",
+    "gyro_timestamp", "gyro_x", "gyro_y", "gyro_z",
 ]
 
 AUDIO_CHANNELS = 1
@@ -728,6 +729,10 @@ def format_eye_csv_row(sample):
         f"{sample['right_openness']:.6f}",
         str(int(sample["left_blink"])),
         str(int(sample["right_blink"])),
+        str(int(sample.get("gyro_timestamp", 0))),
+        f"{sample.get('gyro_x', 0.0):.6f}",
+        f"{sample.get('gyro_y', 0.0):.6f}",
+        f"{sample.get('gyro_z', 0.0):.6f}",
     ]
 
 
@@ -750,6 +755,8 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         # Data & Buffers
         self.sensor_rate_tracker = PacketRateTracker()
         self.eye_rate_tracker = PacketRateTracker()
+        self.eye_gyro_rate_tracker = PacketRateTracker()
+        self._last_eye_gyro_timestamp = None
         
         self.sensor_buffers = MultiSeriesBuffer(args.sensor_sample_rate, args.window_seconds)
         
@@ -757,6 +764,9 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.eye_gaze_y_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
         self.eye_left_pupil_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
         self.eye_right_pupil_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
+        self.eye_gyro_x_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
+        self.eye_gyro_y_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
+        self.eye_gyro_z_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
 
         # Plot loop states
         self.last_plot_update_ms = 0.0
@@ -825,9 +835,10 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         # Eye status
         self.lbl_eye_rate = QtWidgets.QLabel("Eye Rate: -- Hz")
         self.lbl_eye_packets = QtWidgets.QLabel("Eye Pkts: 0")
+        self.lbl_eye_gyro_rate = QtWidgets.QLabel("Gyro Rate: -- Hz")
 
         for lbl in (self.lbl_sensor_rate, self.lbl_sensor_packets, self.lbl_sensor_temp,
-                    self.lbl_eye_rate, self.lbl_eye_packets):
+                    self.lbl_eye_rate, self.lbl_eye_packets, self.lbl_eye_gyro_rate):
             lbl.setStyleSheet(label_style)
             metrics_bar.addWidget(lbl)
             
@@ -1074,6 +1085,18 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.pupil_l_curve = self.pupil_plot_widget.plot(pen=pg.mkPen("#9AD1FF", width=2), name="Left")
         self.pupil_r_curve = self.pupil_plot_widget.plot(pen=pg.mkPen("#FFD166", width=2), name="Right")
 
+        self.eye_gyro_plot_widget = pg.PlotWidget()
+        eye_gyro_it = self.eye_gyro_plot_widget.getPlotItem()
+        eye_gyro_it.setTitle("Eye Tracker Gyroscope")
+        eye_gyro_it.setLabel("left", "dps")
+        eye_gyro_it.setXRange(-self.args.window_seconds, 0.0, padding=0.0)
+        eye_gyro_it.setXLink(self.ppg_red_plot)
+        eye_gyro_it.showGrid(x=True, y=True, alpha=t['grid_alpha'])
+        eye_gyro_it.addLegend(offset=(6,6))
+        self.eye_gyro_x_curve = self.eye_gyro_plot_widget.plot(pen=pg.mkPen("#E63946", width=1.5), name="X")
+        self.eye_gyro_y_curve = self.eye_gyro_plot_widget.plot(pen=pg.mkPen("#457B9D", width=1.5), name="Y")
+        self.eye_gyro_z_curve = self.eye_gyro_plot_widget.plot(pen=pg.mkPen("#2A9D8F", width=1.5), name="Z")
+
         imu_column = QtWidgets.QVBoxLayout()
         imu_column.setSpacing(8)
         imu_column.addWidget(self.accel_plot[0])
@@ -1084,6 +1107,7 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         eye_wave_column.setSpacing(8)
         eye_wave_column.addWidget(self.gaze_plot_widget)
         eye_wave_column.addWidget(self.pupil_plot_widget)
+        eye_wave_column.addWidget(self.eye_gyro_plot_widget)
 
         plots_row.addWidget(self.ppg_widget, stretch=2)
         plots_row.addLayout(imu_column, stretch=1)
@@ -1835,6 +1859,13 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
                 self.eye_gaze_y_series.append([s["gaze_y"]])
                 self.eye_left_pupil_series.append([s["left_pupil_diameter_mm"]])
                 self.eye_right_pupil_series.append([s["right_pupil_diameter_mm"]])
+                self.eye_gyro_x_series.append([s.get("gyro_x", 0.0)])
+                self.eye_gyro_y_series.append([s.get("gyro_y", 0.0)])
+                self.eye_gyro_z_series.append([s.get("gyro_z", 0.0)])
+                gyro_timestamp = s.get("gyro_timestamp")
+                if gyro_timestamp and gyro_timestamp != self._last_eye_gyro_timestamp:
+                    self._last_eye_gyro_timestamp = gyro_timestamp
+                    self.eye_gyro_rate_tracker.push(s["pc_arrival_timestamp"])
                 if self.eye_csv_writer: self.eye_csv_writer.push(s)
             if last_eye_sample:
                 self._display_gaze_data(last_eye_sample["gaze_x"], last_eye_sample["gaze_y"])
@@ -1885,6 +1916,13 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
                 self.pupil_l_curve.setData(p_x, p_l)
                 self.pupil_r_curve.setData(p_x, self.eye_right_pupil_series.ordered())
 
+            gyro_x = self.eye_gyro_x_series.ordered()
+            if len(gyro_x) > 0:
+                gyro_t = self.eye_gyro_x_series.x_axis(len(gyro_x))
+                self.eye_gyro_x_curve.setData(gyro_t, gyro_x)
+                self.eye_gyro_y_curve.setData(gyro_t, self.eye_gyro_y_series.ordered())
+                self.eye_gyro_z_curve.setData(gyro_t, self.eye_gyro_z_series.ordered())
+
     def _auto_range(self, plot_item, values):
         if len(values) < 8: return
         lower = float(np.percentile(values, 1.0)); upper = float(np.percentile(values, 99.0))
@@ -1905,6 +1943,8 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         if len(acc_s) > 0: self._auto_range(self.accel_plot[0].getPlotItem(), acc_s)
         if len(gyr_s) > 0: self._auto_range(self.gyro_plot[0].getPlotItem(), gyr_s)
         if len(mag_s) > 0: self._auto_range(self.mag_plot[0].getPlotItem(), mag_s)
+        eye_gyr_s = np.vstack((self.eye_gyro_x_series.ordered(), self.eye_gyro_y_series.ordered(), self.eye_gyro_z_series.ordered())).flatten()
+        if len(eye_gyr_s) > 0: self._auto_range(self.eye_gyro_plot_widget.getPlotItem(), eye_gyr_s)
 
     def _update_metrics(self):
         self.lbl_sensor_rate.setText(f"Sen Rate: {self.sensor_rate_tracker.current_rate():.1f} Hz")
@@ -1913,6 +1953,7 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.lbl_sensor_temp.setText(f"Sen Temp: {tval:.2f}" if tval and tval == tval else "Sen Temp: --")
         self.lbl_eye_rate.setText(f"Eye Rate: {self.eye_rate_tracker.current_rate():.1f} Hz")
         self.lbl_eye_packets.setText(f"Eye Pkts: {self.eye_packet_count}")
+        self.lbl_eye_gyro_rate.setText(f"Gyro Rate: {self.eye_gyro_rate_tracker.current_rate():.1f} Hz")
         self._update_audio_loudness()
 
     def _update_audio_loudness(self):
