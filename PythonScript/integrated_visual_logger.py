@@ -59,6 +59,7 @@ DISPLAY_WINDOW_SECONDS = 6.0
 PLOT_UPDATE_INTERVAL_MS = 33
 METRIC_UPDATE_INTERVAL_MS = 250
 Y_LIMIT_UPDATE_INTERVAL_MS = 500
+SERIAL_STARTUP_SETTLE_SECONDS = 2.0
 RATE_WINDOW_SECONDS = 3.0
 TARGET_SERIAL_DESCRIPTION = "Silicon Labs CP210x USB to UART Bridge"
 SENSOR_COLUMN_NAMES = [
@@ -1654,6 +1655,7 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
             else:
                 self.sensor_reader = SerialPacketReader(selected_port, int(self.combo_baud.currentText()))
             if self.sensor_reader and self.sensor_reader.open():
+                time.sleep(SERIAL_STARTUP_SETTLE_SECONDS)
                 self.sensor_reader.serial_port.reset_input_buffer()
                 self.sensor_reader.serial_port.reset_output_buffer()
                 self.sensor_csv_writer = CSVWriterThread(
