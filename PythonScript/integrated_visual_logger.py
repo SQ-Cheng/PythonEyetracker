@@ -9,7 +9,6 @@ Uses PyQt5. Start/Stop manages both devices simultaneously. Data is logged to 2 
 import argparse
 import configparser
 import csv
-import ctypes
 import json
 import os
 import queue
@@ -735,6 +734,7 @@ def format_eye_csv_row(sample):
 class IntegratedMonitorWindow(QtWidgets.QMainWindow):
     # Eye Tracker SDK Signals
     set_sdk_running_signal = QtCore.pyqtSignal(bool)
+    set_scene_image_signal = QtCore.pyqtSignal(QPixmap)
     set_calibration_finish_signal = QtCore.pyqtSignal(int, int, int)
 
     def __init__(self, args):
@@ -770,7 +770,6 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.audio_recorder = None
         self.sensor_reader = None
         self._preview_lock = threading.Lock()
-        self._pending_scene_frame = None
         self._pending_left_eye_frame = None
         self._pending_right_eye_frame = None
 
@@ -1446,29 +1445,17 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.combo_calibration_profile.editTextChanged.connect(self._update_calibration_profile_controls)
 
         self.set_sdk_running_signal.connect(self._on_set_sdk_running)
+        self.set_scene_image_signal.connect(self._display_scene_image)
         self.set_calibration_finish_signal.connect(self._on_set_calibration_finish)
 
     # ---- Eye Tracker Callbacks ----
     def wants_preview_frame(self, eye):
         with self._preview_lock:
-            if eye == 13:
-                return self._pending_scene_frame is None
             if eye == 1:
                 return self._pending_left_eye_frame is None
             if eye == 2:
                 return self._pending_right_eye_frame is None
         return False
-
-    def handle_scene_frame(self, frame_bytes, size, width, height, device_timestamp, pc_arrival_timestamp):
-        with self._preview_lock:
-            self._pending_scene_frame = (
-                bytes(frame_bytes),
-                int(size),
-                int(width),
-                int(height),
-                int(device_timestamp),
-                float(pc_arrival_timestamp),
-            )
 
     def handle_eye_preview_frame(self, eye, frame_bytes, width, height, device_timestamp, pc_arrival_timestamp):
         frame = (
@@ -1486,29 +1473,15 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
 
     def _process_preview_frames(self):
         with self._preview_lock:
-            scene_frame = self._pending_scene_frame
             left_frame = self._pending_left_eye_frame
             right_frame = self._pending_right_eye_frame
-            self._pending_scene_frame = None
             self._pending_left_eye_frame = None
             self._pending_right_eye_frame = None
 
-        if scene_frame:
-            self._display_scene_frame(*scene_frame)
         if left_frame:
             self._display_eye_preview_frame(self.labelLeftEye, left_frame)
         if right_frame:
             self._display_eye_preview_frame(self.labelRightEye, right_frame)
-
-    def _display_scene_frame(self, frame_bytes, size, width, height, _device_timestamp, _pc_arrival_timestamp):
-        try:
-            encoded = ctypes.create_string_buffer(frame_bytes)
-            ptr = ctypes.cast(encoded, ctypes.c_void_p)
-            self.eye_sdk.h256_dll_handle._7i_h265_decode(int(size), ptr, self.eye_sdk.scene_img_buf.data, self.eye_sdk.scene_img_size_max)
-            image = QPixmap.fromImage(QImage(self.eye_sdk.scene_img_buf.data, int(width), int(height), QImage.Format_BGR888))
-            self._display_scene_image(image)
-        except Exception as exc:
-            print(f"Scene preview update failed: {exc}")
 
     def _display_eye_preview_frame(self, label, frame):
         frame_bytes, width, height, _device_timestamp, _pc_arrival_timestamp = frame
@@ -1544,7 +1517,6 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         if not enabled:
             self.calibration_is_running = False
             with self._preview_lock:
-                self._pending_scene_frame = None
                 self._pending_left_eye_frame = None
                 self._pending_right_eye_frame = None
             self.labelSceneImage.setPixmap(QPixmap())

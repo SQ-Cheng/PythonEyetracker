@@ -2,6 +2,7 @@ import os
 import queue
 import threading
 import time
+from PyQt5.QtGui import QImage, QPixmap
 from sdk_types import *
 import ctypes
 
@@ -55,14 +56,11 @@ class wrapper:
         pc_arrival_timestamp = time.perf_counter()
         ui = wrapper.ui_handle
         if 13 == eye:  # scene images
-            if ui and hasattr(ui, "handle_scene_frame"):
-                if hasattr(ui, "wants_preview_frame") and not ui.wants_preview_frame(eye):
-                    return
-                try:
-                    frame_bytes = ctypes.string_at(image, int(size))
-                    ui.handle_scene_frame(frame_bytes, int(size), int(width), int(height), int(timestamp), pc_arrival_timestamp)
-                except Exception:
-                    pass
+            if ui and hasattr(ui, "set_scene_image_signal"):
+                ptr = ctypes.cast(image, ctypes.c_void_p)
+                self.h256_dll_handle._7i_h265_decode(size, ptr, self.scene_img_buf.data, self.scene_img_size_max)
+                img = QPixmap.fromImage(QImage(self.scene_img_buf.data, width, height, QImage.Format_BGR888))
+                ui.set_scene_image_signal.emit(img)
         else:
             if PY_7I_EYE_TYPE.L_EYE.value == eye:
                 if ui and hasattr(ui, "handle_eye_preview_frame"):
