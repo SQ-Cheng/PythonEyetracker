@@ -75,7 +75,10 @@ EYE_COLUMN_NAMES = [
     "left_pupil_x", "left_pupil_y", "right_pupil_x", "right_pupil_y",
     "left_pupil_diameter_mm", "right_pupil_diameter_mm",
     "left_openness", "right_openness", "left_blink", "right_blink",
-    "gyro_timestamp", "gyro_x", "gyro_y", "gyro_z",
+    "gyro_timestamp",
+    "accel_x", "accel_y", "accel_z",
+    "gyro_x", "gyro_y", "gyro_z",
+    "mag_x", "mag_y", "mag_z",
 ]
 
 AUDIO_CHANNELS = 1
@@ -730,9 +733,15 @@ def format_eye_csv_row(sample):
         str(int(sample["left_blink"])),
         str(int(sample["right_blink"])),
         str(int(sample.get("gyro_timestamp", 0))),
+        f"{sample.get('accel_x', 0.0):.6f}",
+        f"{sample.get('accel_y', 0.0):.6f}",
+        f"{sample.get('accel_z', 0.0):.6f}",
         f"{sample.get('gyro_x', 0.0):.6f}",
         f"{sample.get('gyro_y', 0.0):.6f}",
         f"{sample.get('gyro_z', 0.0):.6f}",
+        f"{sample.get('mag_x', 0.0):.6f}",
+        f"{sample.get('mag_y', 0.0):.6f}",
+        f"{sample.get('mag_z', 0.0):.6f}",
     ]
 
 
@@ -760,13 +769,15 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         
         self.sensor_buffers = MultiSeriesBuffer(args.sensor_sample_rate, args.window_seconds)
         
-        self.eye_gaze_x_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
-        self.eye_gaze_y_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
-        self.eye_left_pupil_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
-        self.eye_right_pupil_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
+        self.eye_accel_x_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
+        self.eye_accel_y_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
+        self.eye_accel_z_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
         self.eye_gyro_x_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
         self.eye_gyro_y_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
         self.eye_gyro_z_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
+        self.eye_mag_x_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
+        self.eye_mag_y_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
+        self.eye_mag_z_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
 
         # Plot loop states
         self.last_plot_update_ms = 0.0
@@ -817,6 +828,10 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         value_width = QtGui.QFontMetrics(mono_font).horizontalAdvance("-0000.00000") + 16
         sidebar_width = 240
         pg.setConfigOptions(antialias=False, useOpenGL=False, background=t['bg'], foreground=t['fg'])
+        sidebar_label_ss = f"font-size: 10pt; color: {t['label_color']};"
+        eye_title_ss = f"font-size: 10pt; color: {t['label_color']}; font-weight: bold;"
+        self._sidebar_label_ss = sidebar_label_ss
+        self._eye_title_ss = eye_title_ss
         central = QtWidgets.QWidget(self)
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
@@ -856,9 +871,9 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         main_layout.addLayout(sidebar)
 
         group_ss = f"QGroupBox {{ border: 1px solid {t['group_border']}; border-radius: 6px; margin-top: 10px; padding-top: 14px; font-weight: bold; color: {t['group_title']}; }} QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; }}"
-        btn_ss = f"QPushButton {{ background: {t['btn_bg']}; color: {t['btn_text']}; border: 1px solid {t['group_border']}; border-radius: 5px; padding: 6px 12px; font-size: 13px; }} QPushButton:hover {{ background: {t['btn_hover']}; }} QPushButton:pressed {{ background: {t['group_border']}; }} QPushButton:disabled {{ background: {t['btn_disabled_bg']}; color: {t['btn_disabled_text']}; }}"
-        combo_ss = f"QComboBox {{ background: {t['value_bg']}; color: {t['fg']}; border: 1px solid {t['group_border']}; border-radius: 4px; padding: 3px 8px; font-size: 12px; }} QComboBox::drop-down {{ border: none; }} QComboBox QAbstractItemView {{ background: {t['value_bg']}; color: {t['fg']}; selection-background-color: {t['btn_hover']}; }}"
-        val_ss = f"QLabel {{ background: {t['value_bg']}; color: {t['value_fg']}; border: 1px solid {t['group_border']}; border-radius: 4px; padding: 2px 6px; font-family: 'Consolas', 'Monaco', monospace; font-size: 12px; min-width: 70px; }}"
+        btn_ss = f"QPushButton {{ background: {t['btn_bg']}; color: {t['btn_text']}; border: 1px solid {t['group_border']}; border-radius: 5px; padding: 6px 12px; font-size: 10pt; }} QPushButton:hover {{ background: {t['btn_hover']}; }} QPushButton:pressed {{ background: {t['group_border']}; }} QPushButton:disabled {{ background: {t['btn_disabled_bg']}; color: {t['btn_disabled_text']}; }}"
+        combo_ss = f"QComboBox {{ background: {t['value_bg']}; color: {t['fg']}; border: 1px solid {t['group_border']}; border-radius: 4px; padding: 3px 8px; font-size: 10pt; }} QComboBox::drop-down {{ border: none; }} QComboBox QAbstractItemView {{ background: {t['value_bg']}; color: {t['fg']}; selection-background-color: {t['btn_hover']}; }}"
+        val_ss = f"QLabel {{ background: {t['value_bg']}; color: {t['value_fg']}; border: 1px solid {t['group_border']}; border-radius: 4px; padding: 2px 6px; font-family: 'Consolas', 'Monaco', monospace; font-size: 10pt; min-width: 70px; }}"
 
         # Global Control
         self.btn_start = QtWidgets.QPushButton("▶ Start All")
@@ -884,8 +899,12 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.combo_baud.setStyleSheet(combo_ss)
         self.combo_baud.addItems(["9600", "115200", "1000000"])
         self.combo_baud.setCurrentText(str(self.args.baud))
-        lo_sensor.addWidget(QtWidgets.QLabel("Port:")); lo_sensor.addWidget(self.combo_port)
-        lo_sensor.addWidget(QtWidgets.QLabel("Baudrate:")); lo_sensor.addWidget(self.combo_baud)
+        _lbl_port = QtWidgets.QLabel("Port:")
+        _lbl_port.setStyleSheet(sidebar_label_ss)
+        lo_sensor.addWidget(_lbl_port); lo_sensor.addWidget(self.combo_port)
+        _lbl_baud = QtWidgets.QLabel("Baudrate:")
+        _lbl_baud.setStyleSheet(sidebar_label_ss)
+        lo_sensor.addWidget(_lbl_baud); lo_sensor.addWidget(self.combo_baud)
         sidebar.addWidget(grp_sensor)
 
         # Audio Settings
@@ -899,8 +918,12 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.combo_audio_rate.setStyleSheet(combo_ss)
         self.combo_audio_device.popup_requested.connect(self._populate_audio_devices)
         self.combo_audio_device.currentIndexChanged.connect(self._populate_audio_sample_rates)
-        lo_audio.addWidget(QtWidgets.QLabel("Microphone:")); lo_audio.addWidget(self.combo_audio_device)
-        lo_audio.addWidget(QtWidgets.QLabel("Sample Rate:")); lo_audio.addWidget(self.combo_audio_rate)
+        _lbl_mic = QtWidgets.QLabel("Microphone:")
+        _lbl_mic.setStyleSheet(sidebar_label_ss)
+        lo_audio.addWidget(_lbl_mic); lo_audio.addWidget(self.combo_audio_device)
+        _lbl_rate = QtWidgets.QLabel("Sample Rate:")
+        _lbl_rate.setStyleSheet(sidebar_label_ss)
+        lo_audio.addWidget(_lbl_rate); lo_audio.addWidget(self.combo_audio_rate)
         sidebar.addWidget(grp_audio)
         self._populate_audio_devices()
 
@@ -916,8 +939,12 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.combo_res.setStyleSheet(combo_ss)
         self.combo_res.addItem("1280 * 960", 201); self.combo_res.addItem("1280 * 720", 202); self.combo_res.addItem("800 * 600", 203); self.combo_res.addItem("1920 * 1080", 204)
         self.combo_res.setCurrentIndex(1)
-        lo_eye.addWidget(QtWidgets.QLabel("Env:")); lo_eye.addWidget(self.combo_env)
-        lo_eye.addWidget(QtWidgets.QLabel("Res:")); lo_eye.addWidget(self.combo_res)
+        _lbl_env = QtWidgets.QLabel("Env:")
+        _lbl_env.setStyleSheet(sidebar_label_ss)
+        lo_eye.addWidget(_lbl_env); lo_eye.addWidget(self.combo_env)
+        _lbl_res = QtWidgets.QLabel("Res:")
+        _lbl_res.setStyleSheet(sidebar_label_ss)
+        lo_eye.addWidget(_lbl_res); lo_eye.addWidget(self.combo_res)
         sidebar.addWidget(grp_eye)
 
         # Calibration
@@ -935,7 +962,9 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.btn_cal_stop = QtWidgets.QPushButton("Stop Calibration")
         self.btn_cal_stop.setStyleSheet(btn_ss)
         self.btn_cal_stop.setEnabled(False)
-        lo_cal.addWidget(QtWidgets.QLabel("Points:")); lo_cal.addWidget(self.combo_points)
+        _lbl_points = QtWidgets.QLabel("Points:")
+        _lbl_points.setStyleSheet(sidebar_label_ss)
+        lo_cal.addWidget(_lbl_points); lo_cal.addWidget(self.combo_points)
         lo_cal.addWidget(self.btn_cal_start); lo_cal.addWidget(self.btn_cal_stop)
         sidebar.addWidget(grp_cal)
 
@@ -1024,8 +1053,14 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
             f"QProgressBar::chunk {{ background: {t['value_fg']}; border-radius: 3px; }}"
         )
         
-        lyt_left_eye = QtWidgets.QVBoxLayout(); lyt_left_eye.addWidget(QtWidgets.QLabel("Left Eye"), alignment=Qt.AlignCenter); lyt_left_eye.addWidget(self.labelLeftEye)
-        lyt_right_eye = QtWidgets.QVBoxLayout(); lyt_right_eye.addWidget(QtWidgets.QLabel("Right Eye"), alignment=Qt.AlignCenter); lyt_right_eye.addWidget(self.labelRightEye)
+        _lbl_left_eye = QtWidgets.QLabel("Left Eye")
+        _lbl_left_eye.setStyleSheet(eye_title_ss)
+        _lbl_left_eye.setAlignment(Qt.AlignCenter)
+        _lbl_right_eye = QtWidgets.QLabel("Right Eye")
+        _lbl_right_eye.setStyleSheet(eye_title_ss)
+        _lbl_right_eye.setAlignment(Qt.AlignCenter)
+        lyt_left_eye = QtWidgets.QVBoxLayout(); lyt_left_eye.addWidget(_lbl_left_eye); lyt_left_eye.addWidget(self.labelLeftEye)
+        lyt_right_eye = QtWidgets.QVBoxLayout(); lyt_right_eye.addWidget(_lbl_right_eye); lyt_right_eye.addWidget(self.labelRightEye)
         lyt_right_eye.addWidget(self.audio_loudness_bar)
         
         eyes_col.addLayout(lyt_left_eye)
@@ -1066,36 +1101,10 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.gyro_plot = self._create_pg_plot("Gyroscope", "dps", ["#F72585", "#B5179E", "#7209B7"], ["X", "Y", "Z"], self.ppg_red_plot)
         self.mag_plot = self._create_pg_plot("Magnetometer", "µT", ["#FF9F1C", "#E71D36", "#2EC4B6"], ["X", "Y", "Z"], self.ppg_red_plot)
 
-        # Eye tracker plots
-        self.gaze_plot_widget = pg.PlotWidget()
-        gaze_it = self.gaze_plot_widget.getPlotItem()
-        gaze_it.setTitle("Gaze X / Y"); gaze_it.showGrid(x=True, y=True, alpha=t['grid_alpha'])
-        gaze_it.setXRange(-self.args.window_seconds, 0.0, padding=0.0)
-        gaze_it.setXLink(self.ppg_red_plot)
-        gaze_it.addLegend(offset=(6,6))
-        self.gaze_x_curve = self.gaze_plot_widget.plot(pen=pg.mkPen("#4ED1A6", width=2), name="Gaze X")
-        self.gaze_y_curve = self.gaze_plot_widget.plot(pen=pg.mkPen("#FF7F50", width=2), name="Gaze Y")
-        
-        self.pupil_plot_widget = pg.PlotWidget()
-        pupil_it = self.pupil_plot_widget.getPlotItem()
-        pupil_it.setTitle("Pupil Diameter (mm)"); pupil_it.showGrid(x=True, y=True, alpha=t['grid_alpha'])
-        pupil_it.setXRange(-self.args.window_seconds, 0.0, padding=0.0)
-        pupil_it.setXLink(self.ppg_red_plot)
-        pupil_it.addLegend(offset=(6,6))
-        self.pupil_l_curve = self.pupil_plot_widget.plot(pen=pg.mkPen("#9AD1FF", width=2), name="Left")
-        self.pupil_r_curve = self.pupil_plot_widget.plot(pen=pg.mkPen("#FFD166", width=2), name="Right")
-
-        self.eye_gyro_plot_widget = pg.PlotWidget()
-        eye_gyro_it = self.eye_gyro_plot_widget.getPlotItem()
-        eye_gyro_it.setTitle("Eye Tracker Gyroscope")
-        eye_gyro_it.setLabel("left", "dps")
-        eye_gyro_it.setXRange(-self.args.window_seconds, 0.0, padding=0.0)
-        eye_gyro_it.setXLink(self.ppg_red_plot)
-        eye_gyro_it.showGrid(x=True, y=True, alpha=t['grid_alpha'])
-        eye_gyro_it.addLegend(offset=(6,6))
-        self.eye_gyro_x_curve = self.eye_gyro_plot_widget.plot(pen=pg.mkPen("#E63946", width=1.5), name="X")
-        self.eye_gyro_y_curve = self.eye_gyro_plot_widget.plot(pen=pg.mkPen("#457B9D", width=1.5), name="Y")
-        self.eye_gyro_z_curve = self.eye_gyro_plot_widget.plot(pen=pg.mkPen("#2A9D8F", width=1.5), name="Z")
+        # Eye tracker IMU plots
+        self.eye_accel_plot = self._create_pg_plot("Eye Tracker Accelerometer", "g", ["#4CC9F0", "#FFD166", "#06D6A0"], ["X", "Y", "Z"], self.ppg_red_plot)
+        self.eye_gyro_plot = self._create_pg_plot("Eye Tracker Gyroscope", "dps", ["#F72585", "#B5179E", "#7209B7"], ["X", "Y", "Z"], self.ppg_red_plot)
+        self.eye_mag_plot = self._create_pg_plot("Eye Tracker Magnetometer", "uT", ["#FF9F1C", "#E71D36", "#2EC4B6"], ["X", "Y", "Z"], self.ppg_red_plot)
 
         imu_column = QtWidgets.QVBoxLayout()
         imu_column.setSpacing(8)
@@ -1105,9 +1114,9 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
 
         eye_wave_column = QtWidgets.QVBoxLayout()
         eye_wave_column.setSpacing(8)
-        eye_wave_column.addWidget(self.gaze_plot_widget)
-        eye_wave_column.addWidget(self.pupil_plot_widget)
-        eye_wave_column.addWidget(self.eye_gyro_plot_widget)
+        eye_wave_column.addWidget(self.eye_accel_plot[0])
+        eye_wave_column.addWidget(self.eye_gyro_plot[0])
+        eye_wave_column.addWidget(self.eye_mag_plot[0])
 
         plots_row.addWidget(self.ppg_widget, stretch=2)
         plots_row.addLayout(imu_column, stretch=1)
@@ -1855,13 +1864,15 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
                 self.eye_rate_tracker.push(s["pc_arrival_timestamp"])
                 self.eye_packet_count += 1
                 last_eye_sample = s
-                self.eye_gaze_x_series.append([s["gaze_x"]])
-                self.eye_gaze_y_series.append([s["gaze_y"]])
-                self.eye_left_pupil_series.append([s["left_pupil_diameter_mm"]])
-                self.eye_right_pupil_series.append([s["right_pupil_diameter_mm"]])
+                self.eye_accel_x_series.append([s.get("accel_x", 0.0)])
+                self.eye_accel_y_series.append([s.get("accel_y", 0.0)])
+                self.eye_accel_z_series.append([s.get("accel_z", 0.0)])
                 self.eye_gyro_x_series.append([s.get("gyro_x", 0.0)])
                 self.eye_gyro_y_series.append([s.get("gyro_y", 0.0)])
                 self.eye_gyro_z_series.append([s.get("gyro_z", 0.0)])
+                self.eye_mag_x_series.append([s.get("mag_x", 0.0)])
+                self.eye_mag_y_series.append([s.get("mag_y", 0.0)])
+                self.eye_mag_z_series.append([s.get("mag_z", 0.0)])
                 gyro_timestamp = s.get("gyro_timestamp")
                 if gyro_timestamp and gyro_timestamp != self._last_eye_gyro_timestamp:
                     self._last_eye_gyro_timestamp = gyro_timestamp
@@ -1903,25 +1914,19 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
             self.gyro_plot[1][0].setData(x_sen, self.sensor_buffers.gx.ordered()); self.gyro_plot[1][1].setData(x_sen, self.sensor_buffers.gy.ordered()); self.gyro_plot[1][2].setData(x_sen, self.sensor_buffers.gz.ordered())
             self.mag_plot[1][0].setData(x_sen, self.sensor_buffers.mx.ordered()); self.mag_plot[1][1].setData(x_sen, self.sensor_buffers.my.ordered()); self.mag_plot[1][2].setData(x_sen, self.sensor_buffers.mz.ordered())
 
-        # Update Eye Plots
-        gaze_x = self.eye_gaze_x_series.ordered()
-        if len(gaze_x) > 0:
-            x_eye = self.eye_gaze_x_series.x_axis(len(gaze_x))
-            self.gaze_x_curve.setData(x_eye, gaze_x)
-            self.gaze_y_curve.setData(x_eye, self.eye_gaze_y_series.ordered())
-            
-            p_l = self.eye_left_pupil_series.ordered()
-            if len(p_l) > 0:
-                p_x = self.eye_left_pupil_series.x_axis(len(p_l))
-                self.pupil_l_curve.setData(p_x, p_l)
-                self.pupil_r_curve.setData(p_x, self.eye_right_pupil_series.ordered())
-
-            gyro_x = self.eye_gyro_x_series.ordered()
-            if len(gyro_x) > 0:
-                gyro_t = self.eye_gyro_x_series.x_axis(len(gyro_x))
-                self.eye_gyro_x_curve.setData(gyro_t, gyro_x)
-                self.eye_gyro_y_curve.setData(gyro_t, self.eye_gyro_y_series.ordered())
-                self.eye_gyro_z_curve.setData(gyro_t, self.eye_gyro_z_series.ordered())
+        # Update Eye Tracker IMU Plots
+        eye_accel_x = self.eye_accel_x_series.ordered()
+        if len(eye_accel_x) > 0:
+            x_eye = self.eye_accel_x_series.x_axis(len(eye_accel_x))
+            self.eye_accel_plot[1][0].setData(x_eye, eye_accel_x)
+            self.eye_accel_plot[1][1].setData(x_eye, self.eye_accel_y_series.ordered())
+            self.eye_accel_plot[1][2].setData(x_eye, self.eye_accel_z_series.ordered())
+            self.eye_gyro_plot[1][0].setData(x_eye, self.eye_gyro_x_series.ordered())
+            self.eye_gyro_plot[1][1].setData(x_eye, self.eye_gyro_y_series.ordered())
+            self.eye_gyro_plot[1][2].setData(x_eye, self.eye_gyro_z_series.ordered())
+            self.eye_mag_plot[1][0].setData(x_eye, self.eye_mag_x_series.ordered())
+            self.eye_mag_plot[1][1].setData(x_eye, self.eye_mag_y_series.ordered())
+            self.eye_mag_plot[1][2].setData(x_eye, self.eye_mag_z_series.ordered())
 
     def _auto_range(self, plot_item, values):
         if len(values) < 8: return
@@ -1943,8 +1948,12 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         if len(acc_s) > 0: self._auto_range(self.accel_plot[0].getPlotItem(), acc_s)
         if len(gyr_s) > 0: self._auto_range(self.gyro_plot[0].getPlotItem(), gyr_s)
         if len(mag_s) > 0: self._auto_range(self.mag_plot[0].getPlotItem(), mag_s)
+        eye_acc_s = np.vstack((self.eye_accel_x_series.ordered(), self.eye_accel_y_series.ordered(), self.eye_accel_z_series.ordered())).flatten()
         eye_gyr_s = np.vstack((self.eye_gyro_x_series.ordered(), self.eye_gyro_y_series.ordered(), self.eye_gyro_z_series.ordered())).flatten()
-        if len(eye_gyr_s) > 0: self._auto_range(self.eye_gyro_plot_widget.getPlotItem(), eye_gyr_s)
+        eye_mag_s = np.vstack((self.eye_mag_x_series.ordered(), self.eye_mag_y_series.ordered(), self.eye_mag_z_series.ordered())).flatten()
+        if len(eye_acc_s) > 0: self._auto_range(self.eye_accel_plot[0].getPlotItem(), eye_acc_s)
+        if len(eye_gyr_s) > 0: self._auto_range(self.eye_gyro_plot[0].getPlotItem(), eye_gyr_s)
+        if len(eye_mag_s) > 0: self._auto_range(self.eye_mag_plot[0].getPlotItem(), eye_mag_s)
 
     def _update_metrics(self):
         self.lbl_sensor_rate.setText(f"Sen Rate: {self.sensor_rate_tracker.current_rate():.1f} Hz")
@@ -1998,6 +2007,9 @@ def main():
         
     args = parse_args()
     app = QtWidgets.QApplication(sys.argv)
+    font = app.font()
+    font.setPointSize(10)
+    app.setFont(font)
     window = IntegratedMonitorWindow(args)
     window.show()
     sys.exit(app.exec_())

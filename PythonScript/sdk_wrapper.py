@@ -110,6 +110,12 @@ class wrapper:
             "gyro_x": float(gyro_data.gyro[0]),
             "gyro_y": float(gyro_data.gyro[1]),
             "gyro_z": float(gyro_data.gyro[2]),
+            "accel_x": float(gyro_data.accel[0]),
+            "accel_y": float(gyro_data.accel[1]),
+            "accel_z": float(gyro_data.accel[2]),
+            "mag_x": float(gyro_data.mag[0]),
+            "mag_y": float(gyro_data.mag[1]),
+            "mag_z": float(gyro_data.mag[2]),
         }
         try:
             self.data_queue.put(sample)
