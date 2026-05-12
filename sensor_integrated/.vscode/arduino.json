@@ -1,5 +1,5 @@
 {
-  "port": "COM10",
+  "port": "COM9",
   "configuration": "softdevice=s132v6,debug=l0,debug_output=serial",
   "output": "build",
   "board": "adafruit:nrf52:feather52832",
@@ -10,7 +10,7 @@
   "compile_profile": "",
   "monitorPortSettings": {
     "settings": {
-      "port": "COM10",
+      "port": "COM9",
       "baudRate": 115200,
       "lineEnding": "\r\n",
       "dataBits": 8,

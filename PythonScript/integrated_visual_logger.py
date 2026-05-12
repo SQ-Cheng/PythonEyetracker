@@ -59,9 +59,11 @@ DISPLAY_WINDOW_SECONDS = 6.0
 PLOT_UPDATE_INTERVAL_MS = 33
 METRIC_UPDATE_INTERVAL_MS = 250
 Y_LIMIT_UPDATE_INTERVAL_MS = 500
-SERIAL_STARTUP_SETTLE_SECONDS = 2.0
+SENSOR_IDENTITY_TIMEOUT_SECONDS = 6.0
 RATE_WINDOW_SECONDS = 3.0
 TARGET_SERIAL_DESCRIPTION = "Silicon Labs CP210x USB to UART Bridge"
+SENSOR_ROLES = ("ring", "watch")
+SENSOR_DISPLAY_NAMES = {"ring": "Ring", "watch": "Watch"}
 SENSOR_COLUMN_NAMES = [
     'Red', 'IR', 'Green',
     'accX', 'accY', 'accZ',
@@ -183,14 +185,6 @@ class SceneImageLabel(AspectRatioPixmapLabel):
         self.button_clicked_signal.connect(slot_func)
 
 
-class SensorPortComboBox(QtWidgets.QComboBox):
-    popup_requested = QtCore.pyqtSignal()
-
-    def showPopup(self):
-        self.popup_requested.emit()
-        super().showPopup()
-
-
 class AudioDeviceComboBox(QtWidgets.QComboBox):
     popup_requested = QtCore.pyqtSignal()
 
@@ -294,6 +288,31 @@ class MultiSeriesBuffer:
         self.mz = RingSeries(sample_rate_hz, window_seconds, True)
 
 
+class SensorChannel:
+    def __init__(self, role, sample_rate_hz, window_seconds):
+        self.role = role
+        self.display_name = SENSOR_DISPLAY_NAMES[role]
+        self.buffers = MultiSeriesBuffer(sample_rate_hz, window_seconds)
+        self.rate_tracker = PacketRateTracker()
+        self.latest_temp = None
+        self.reader = None
+        self.csv_writer = None
+        self.ppg_widget = None
+        self.ppg_plots = None
+        self.ppg_curves = None
+        self.accel_plot = None
+        self.gyro_plot = None
+        self.mag_plot = None
+        self.rate_label = None
+        self.packets_label = None
+        self.temp_label = None
+
+    def reset_data(self, sample_rate_hz, window_seconds):
+        self.buffers = MultiSeriesBuffer(sample_rate_hz, window_seconds)
+        self.rate_tracker = PacketRateTracker()
+        self.latest_temp = None
+
+
 # ===================== Sensor Component =====================
 class SerialPacketReader:
     def __init__(self, port, baudrate):
@@ -302,6 +321,7 @@ class SerialPacketReader:
         self.packet_size = PACKET_SIZE
         self.serial_port = None
         self.packet_queue = queue.SimpleQueue()
+        self.identity = None
         self._buffer = bytearray()
         self._text_buffer = bytearray()
         self._write_lock = threading.Lock()
@@ -332,6 +352,24 @@ class SerialPacketReader:
         except Exception as e:
             print(f"Serial reader err: {e}")
             return False
+
+    def detect_identity(self, timeout_seconds=SENSOR_IDENTITY_TIMEOUT_SECONDS):
+        if not self.serial_port and not self.open():
+            return None
+        deadline = time.perf_counter() + timeout_seconds
+        while not self._stop_event.is_set() and time.perf_counter() < deadline:
+            if self.identity:
+                return self.identity
+            if not self.serial_port or not self.serial_port.is_open:
+                break
+            try:
+                incoming = self.serial_port.read(self.serial_port.in_waiting or 1)
+                if incoming:
+                    self._buffer.extend(incoming)
+                    self._consume_packets()
+            except Exception:
+                break
+        return self.identity
 
     def stop(self):
         self._stop_event.set()
@@ -411,7 +449,9 @@ class SerialPacketReader:
             self._handle_text_line(line.decode("ascii", errors="ignore").strip())
 
     def _handle_text_line(self, line):
-        return
+        marker = line.strip().casefold()
+        if marker in SENSOR_ROLES:
+            self.identity = marker
 
 
 # ===================== Audio Component =====================
@@ -762,12 +802,13 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         os.makedirs(self.calibration_root, exist_ok=True)
 
         # Data & Buffers
-        self.sensor_rate_tracker = PacketRateTracker()
         self.eye_rate_tracker = PacketRateTracker()
-        self.eye_gyro_rate_tracker = PacketRateTracker()
-        self._last_eye_gyro_timestamp = None
+        self.eye_imu_rate_tracker = PacketRateTracker()
         
-        self.sensor_buffers = MultiSeriesBuffer(args.sensor_sample_rate, args.window_seconds)
+        self.sensor_channels = {
+            role: SensorChannel(role, args.sensor_sample_rate, args.window_seconds)
+            for role in SENSOR_ROLES
+        }
         
         self.eye_accel_x_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
         self.eye_accel_y_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
@@ -784,13 +825,9 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.last_metric_update_ms = 0.0
         self.last_range_update_ms = 0.0
         
-        self.sensor_latest_temp = None
-
         # Writers & Reader components
-        self.sensor_csv_writer = None
         self.eye_csv_writer = None
         self.audio_recorder = None
-        self.sensor_reader = None
         self._preview_lock = threading.Lock()
         self._pending_left_eye_frame = None
         self._pending_right_eye_frame = None
@@ -844,16 +881,26 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         label_style = f"font-size: 13px; color: {t['label_color']};"
         
         # Sensor status
-        self.lbl_sensor_rate = QtWidgets.QLabel("Sen Rate: -- Hz")
-        self.lbl_sensor_packets = QtWidgets.QLabel("Sen Pkts: 0")
-        self.lbl_sensor_temp = QtWidgets.QLabel("Sen Temp: --")
+        self.lbl_ring_rate = QtWidgets.QLabel("Ring Rate: -- Hz")
+        self.lbl_ring_packets = QtWidgets.QLabel("Ring Pkts: 0")
+        self.lbl_ring_temp = QtWidgets.QLabel("Ring Temp: --")
+        self.lbl_watch_rate = QtWidgets.QLabel("Watch Rate: -- Hz")
+        self.lbl_watch_packets = QtWidgets.QLabel("Watch Pkts: 0")
+        self.lbl_watch_temp = QtWidgets.QLabel("Watch Temp: --")
+        self.sensor_channels["ring"].rate_label = self.lbl_ring_rate
+        self.sensor_channels["ring"].packets_label = self.lbl_ring_packets
+        self.sensor_channels["ring"].temp_label = self.lbl_ring_temp
+        self.sensor_channels["watch"].rate_label = self.lbl_watch_rate
+        self.sensor_channels["watch"].packets_label = self.lbl_watch_packets
+        self.sensor_channels["watch"].temp_label = self.lbl_watch_temp
         # Eye status
         self.lbl_eye_rate = QtWidgets.QLabel("Eye Rate: -- Hz")
         self.lbl_eye_packets = QtWidgets.QLabel("Eye Pkts: 0")
-        self.lbl_eye_gyro_rate = QtWidgets.QLabel("Gyro Rate: -- Hz")
+        self.lbl_eye_imu_rate = QtWidgets.QLabel("Eye IMU Rate: -- Hz")
 
-        for lbl in (self.lbl_sensor_rate, self.lbl_sensor_packets, self.lbl_sensor_temp,
-                    self.lbl_eye_rate, self.lbl_eye_packets, self.lbl_eye_gyro_rate):
+        for lbl in (self.lbl_ring_rate, self.lbl_ring_packets, self.lbl_ring_temp,
+                    self.lbl_watch_rate, self.lbl_watch_packets, self.lbl_watch_temp,
+                    self.lbl_eye_rate, self.lbl_eye_packets, self.lbl_eye_imu_rate):
             lbl.setStyleSheet(label_style)
             metrics_bar.addWidget(lbl)
             
@@ -891,17 +938,14 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         grp_sensor.setStyleSheet(group_ss)
         grp_sensor.setFixedWidth(sidebar_width)
         lo_sensor = QtWidgets.QVBoxLayout(grp_sensor)
-        self.combo_port = SensorPortComboBox()
-        self.combo_port.setStyleSheet(combo_ss)
-        self.combo_port.popup_requested.connect(self._populate_sensor_ports)
-        self._populate_sensor_ports()
+        self.lbl_sensor_ports = QtWidgets.QLabel("Auto-detect Ring + Watch")
+        self.lbl_sensor_ports.setStyleSheet(sidebar_label_ss)
+        self.lbl_sensor_ports.setWordWrap(True)
         self.combo_baud = QtWidgets.QComboBox()
         self.combo_baud.setStyleSheet(combo_ss)
         self.combo_baud.addItems(["9600", "115200", "1000000"])
         self.combo_baud.setCurrentText(str(self.args.baud))
-        _lbl_port = QtWidgets.QLabel("Port:")
-        _lbl_port.setStyleSheet(sidebar_label_ss)
-        lo_sensor.addWidget(_lbl_port); lo_sensor.addWidget(self.combo_port)
+        lo_sensor.addWidget(self.lbl_sensor_ports)
         _lbl_baud = QtWidgets.QLabel("Baudrate:")
         _lbl_baud.setStyleSheet(sidebar_label_ss)
         lo_sensor.addWidget(_lbl_baud); lo_sensor.addWidget(self.combo_baud)
@@ -1073,44 +1117,19 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         # -- Bottom Content: Plot Columns --
         plots_row = QtWidgets.QHBoxLayout()
         plots_row.setSpacing(8)
-        
-        # PPG Widget
-        self.ppg_widget = pg.GraphicsLayoutWidget()
-        self.ppg_widget.setBackground(t['bg'])
-        self.ppg_red_plot = self.ppg_widget.addPlot(row=0, col=0, title="PPG Red")
-        self.ppg_ir_plot = self.ppg_widget.addPlot(row=1, col=0, title="PPG IR")
-        self.ppg_green_plot = self.ppg_widget.addPlot(row=2, col=0, title="PPG Green")
-        
-        # Link PPG axes together to align them natively inside the GraphicsLayout
-        self.ppg_ir_plot.setXLink(self.ppg_red_plot)
-        self.ppg_green_plot.setXLink(self.ppg_red_plot)
-        self.ppg_red_plot.getAxis('bottom').setStyle(showValues=False)
-        self.ppg_ir_plot.getAxis('bottom').setStyle(showValues=False)
-        self.ppg_green_plot.setLabel("bottom", "Time", units="s")
-        self.ppg_widget.ci.layout.setRowStretchFactor(0, 1)
-        self.ppg_widget.ci.layout.setRowStretchFactor(1, 1)
-        self.ppg_widget.ci.layout.setRowStretchFactor(2, 1)
 
-        self.ppg_curves = []
-        for plt_ref, col in [(self.ppg_red_plot, "#FF6B6B"), (self.ppg_ir_plot, "#2EC4B6"), (self.ppg_green_plot, "#90BE6D")]:
-            plt_ref.showGrid(x=True, y=True, alpha=t['grid_alpha'])
-            plt_ref.setXRange(-self.args.window_seconds, 0.0, padding=0.0)
-            self.ppg_curves.append(plt_ref.plot(pen=pg.mkPen(color=col, width=1.5)))
-        
-        self.accel_plot = self._create_pg_plot("Accelerometer", "g", ["#4CC9F0", "#FFD166", "#06D6A0"], ["X", "Y", "Z"], self.ppg_red_plot)
-        self.gyro_plot = self._create_pg_plot("Gyroscope", "dps", ["#F72585", "#B5179E", "#7209B7"], ["X", "Y", "Z"], self.ppg_red_plot)
-        self.mag_plot = self._create_pg_plot("Magnetometer", "µT", ["#FF9F1C", "#E71D36", "#2EC4B6"], ["X", "Y", "Z"], self.ppg_red_plot)
+        self.sensor_tabs = QtWidgets.QTabWidget()
+        self.sensor_tabs.setStyleSheet(f"QTabWidget::pane {{ border: 1px solid {t['group_border']}; }}")
+        for role in SENSOR_ROLES:
+            channel = self.sensor_channels[role]
+            self.sensor_tabs.addTab(self._create_sensor_tab(channel), channel.display_name)
+
+        sensor_xlink = self.sensor_channels["ring"].ppg_plots[0]
 
         # Eye tracker IMU plots
-        self.eye_accel_plot = self._create_pg_plot("Eye Tracker Accelerometer", "g", ["#4CC9F0", "#FFD166", "#06D6A0"], ["X", "Y", "Z"], self.ppg_red_plot)
-        self.eye_gyro_plot = self._create_pg_plot("Eye Tracker Gyroscope", "dps", ["#F72585", "#B5179E", "#7209B7"], ["X", "Y", "Z"], self.ppg_red_plot)
-        self.eye_mag_plot = self._create_pg_plot("Eye Tracker Magnetometer", "uT", ["#FF9F1C", "#E71D36", "#2EC4B6"], ["X", "Y", "Z"], self.ppg_red_plot)
-
-        imu_column = QtWidgets.QVBoxLayout()
-        imu_column.setSpacing(8)
-        imu_column.addWidget(self.accel_plot[0])
-        imu_column.addWidget(self.gyro_plot[0])
-        imu_column.addWidget(self.mag_plot[0])
+        self.eye_accel_plot = self._create_pg_plot("Eye Tracker Accelerometer", "g", ["#4CC9F0", "#FFD166", "#06D6A0"], ["X", "Y", "Z"], sensor_xlink)
+        self.eye_gyro_plot = self._create_pg_plot("Eye Tracker Gyroscope", "dps", ["#F72585", "#B5179E", "#7209B7"], ["X", "Y", "Z"], sensor_xlink)
+        self.eye_mag_plot = self._create_pg_plot("Eye Tracker Magnetometer", "uT", ["#FF9F1C", "#E71D36", "#2EC4B6"], ["X", "Y", "Z"], sensor_xlink)
 
         eye_wave_column = QtWidgets.QVBoxLayout()
         eye_wave_column.setSpacing(8)
@@ -1118,11 +1137,54 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         eye_wave_column.addWidget(self.eye_gyro_plot[0])
         eye_wave_column.addWidget(self.eye_mag_plot[0])
 
-        plots_row.addWidget(self.ppg_widget, stretch=2)
-        plots_row.addLayout(imu_column, stretch=1)
+        plots_row.addWidget(self.sensor_tabs, stretch=3)
         plots_row.addLayout(eye_wave_column, stretch=1)
 
         content_layout.addLayout(plots_row, stretch=2)
+
+    def _create_sensor_tab(self, channel):
+        tab = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(tab)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(8)
+
+        channel.ppg_widget, channel.ppg_plots, channel.ppg_curves = self._create_ppg_widget()
+        channel.accel_plot = self._create_pg_plot("Accelerometer", "g", ["#4CC9F0", "#FFD166", "#06D6A0"], ["X", "Y", "Z"], channel.ppg_plots[0])
+        channel.gyro_plot = self._create_pg_plot("Gyroscope", "dps", ["#F72585", "#B5179E", "#7209B7"], ["X", "Y", "Z"], channel.ppg_plots[0])
+        channel.mag_plot = self._create_pg_plot("Magnetometer", "uT", ["#FF9F1C", "#E71D36", "#2EC4B6"], ["X", "Y", "Z"], channel.ppg_plots[0])
+
+        imu_column = QtWidgets.QVBoxLayout()
+        imu_column.setSpacing(8)
+        imu_column.addWidget(channel.accel_plot[0])
+        imu_column.addWidget(channel.gyro_plot[0])
+        imu_column.addWidget(channel.mag_plot[0])
+
+        layout.addWidget(channel.ppg_widget, stretch=2)
+        layout.addLayout(imu_column, stretch=1)
+        return tab
+
+    def _create_ppg_widget(self):
+        widget = pg.GraphicsLayoutWidget()
+        widget.setBackground(self.theme['bg'])
+        red_plot = widget.addPlot(row=0, col=0, title="PPG Red")
+        ir_plot = widget.addPlot(row=1, col=0, title="PPG IR")
+        green_plot = widget.addPlot(row=2, col=0, title="PPG Green")
+
+        ir_plot.setXLink(red_plot)
+        green_plot.setXLink(red_plot)
+        red_plot.getAxis('bottom').setStyle(showValues=False)
+        ir_plot.getAxis('bottom').setStyle(showValues=False)
+        green_plot.setLabel("bottom", "Time", units="s")
+        widget.ci.layout.setRowStretchFactor(0, 1)
+        widget.ci.layout.setRowStretchFactor(1, 1)
+        widget.ci.layout.setRowStretchFactor(2, 1)
+
+        curves = []
+        for plot_item, color in [(red_plot, "#FF6B6B"), (ir_plot, "#2EC4B6"), (green_plot, "#90BE6D")]:
+            plot_item.showGrid(x=True, y=True, alpha=self.theme['grid_alpha'])
+            plot_item.setXRange(-self.args.window_seconds, 0.0, padding=0.0)
+            curves.append(plot_item.plot(pen=pg.mkPen(color=color, width=1.5)))
+        return widget, (red_plot, ir_plot, green_plot), curves
 
     def _create_pg_plot(self, title, ylabel, colors, legend, xlink_target=None):
         w = pg.PlotWidget()
@@ -1141,22 +1203,22 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         return w, curves
 
     def _populate_sensor_ports(self):
-        current_port = self.combo_port.currentData() or self.args.port
-        self.combo_port.clear()
+        matched_ports = self._candidate_sensor_ports()
+        if hasattr(self, "lbl_sensor_ports"):
+            if matched_ports:
+                ports_text = ", ".join(port.device for port in matched_ports)
+                self.lbl_sensor_ports.setText(f"Auto-detect Ring + Watch\nCandidates: {ports_text}")
+            else:
+                self.lbl_sensor_ports.setText("Auto-detect Ring + Watch\nNo candidate ports")
+        return matched_ports
+
+    def _candidate_sensor_ports(self):
         matched_ports = [
             port for port in list_ports.comports()
             if self._is_target_sensor_port(port)
         ]
         matched_ports.sort(key=lambda port: port.device)
-
-        for port in matched_ports:
-            self.combo_port.addItem(f"{port.device} - {port.description}", port.device)
-
-        preferred_index = self.combo_port.findData(current_port)
-        if preferred_index >= 0:
-            self.combo_port.setCurrentIndex(preferred_index)
-        elif self.combo_port.count() > 0:
-            self.combo_port.setCurrentIndex(0)
+        return matched_ports
 
     def _is_target_sensor_port(self, port):
         target = TARGET_SERIAL_DESCRIPTION.casefold()
@@ -1167,6 +1229,45 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
             port.interface,
         )
         return any(target in (field or "").casefold() for field in fields)
+
+    def _detect_sensor_readers(self):
+        baudrate = int(self.combo_baud.currentText())
+        detected = {}
+        duplicate_roles = set()
+        candidate_ports = self._populate_sensor_ports()
+
+        for port in candidate_ports:
+            reader = SerialPacketReader(port.device, baudrate)
+            if not reader.open():
+                continue
+
+            identity = reader.detect_identity()
+            if identity not in SENSOR_ROLES:
+                reader.stop()
+                continue
+
+            if identity in detected:
+                duplicate_roles.add(identity)
+                reader.stop()
+                continue
+
+            detected[identity] = reader
+
+        if duplicate_roles or any(role not in detected for role in SENSOR_ROLES):
+            for reader in detected.values():
+                reader.stop()
+            if duplicate_roles:
+                names = ", ".join(SENSOR_DISPLAY_NAMES[role] for role in sorted(duplicate_roles))
+                raise RuntimeError(f"Duplicate sensor identity detected: {names}.")
+            missing = ", ".join(SENSOR_DISPLAY_NAMES[role] for role in SENSOR_ROLES if role not in detected)
+            raise RuntimeError(f"Missing sensor identity: {missing}.")
+
+        if hasattr(self, "lbl_sensor_ports"):
+            self.lbl_sensor_ports.setText(
+                f"Ring: {detected['ring'].port}\nWatch: {detected['watch'].port}"
+            )
+
+        return detected
 
     def _populate_audio_devices(self):
         current_device = self.combo_audio_device.currentData()
@@ -1673,7 +1774,10 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.btn_start.setEnabled(False)
         self._populate_sensor_ports()
         self._populate_audio_devices()
-        self.sensor_reader = None
+        for channel in self.sensor_channels.values():
+            channel.reader = None
+            channel.csv_writer = None
+            channel.reset_data(self.args.sensor_sample_rate, self.args.window_seconds)
         self.eye_sdk_running = False
         self.audio_recorder = None
 
@@ -1681,40 +1785,32 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         try:
-            # Prepare sensor before active recording begins.
-            selected_port = self.combo_port.currentData()
-            if not selected_port:
-                QtWidgets.QMessageBox.warning(self, "Warning", f"No '{TARGET_SERIAL_DESCRIPTION}' serial port found.")
-            else:
-                self.sensor_reader = SerialPacketReader(selected_port, int(self.combo_baud.currentText()))
-            if self.sensor_reader and self.sensor_reader.open():
-                time.sleep(SERIAL_STARTUP_SETTLE_SECONDS)
-                self.sensor_reader.serial_port.reset_input_buffer()
-                self.sensor_reader.serial_port.reset_output_buffer()
-                self.sensor_csv_writer = CSVWriterThread(
-                    os.path.join(self.log_dir, f"sensor_{ts_str}.csv"),
+            detected_readers = self._detect_sensor_readers()
+            for role in SENSOR_ROLES:
+                channel = self.sensor_channels[role]
+                channel.reader = detected_readers[role]
+                if channel.reader.serial_port:
+                    channel.reader.serial_port.reset_input_buffer()
+                    channel.reader.serial_port.reset_output_buffer()
+                channel.reader._buffer.clear()
+                channel.reader._text_buffer.clear()
+                channel.csv_writer = CSVWriterThread(
+                    os.path.join(self.log_dir, f"{role}_{ts_str}.csv"),
                     SENSOR_COLUMN_NAMES,
                     format_sensor_csv_row,
                 )
-                self.sensor_csv_writer.start()
-                if self.sensor_reader.start():
-                    pass
-                else:
-                    self.sensor_csv_writer.stop()
-                    self.sensor_csv_writer = None
-                    self.sensor_reader.stop()
-                    self.sensor_reader = None
-                    QtWidgets.QMessageBox.warning(self, "Warning", "Sensor reader thread failed to start.")
-            elif selected_port:
-                QtWidgets.QMessageBox.warning(self, "Warning", "Sensor failed to connect.")
+                channel.csv_writer.start()
+                if not channel.reader.start():
+                    raise RuntimeError(f"{channel.display_name} reader thread failed to start.")
 
             if not self._start_audio_recording(ts_str):
                 self._cleanup_start_failure()
                 return
 
             self.system_running = True
-            if self.sensor_reader:
-                self.sensor_reader.send_command("s\n")
+            for channel in self.sensor_channels.values():
+                if channel.reader:
+                    channel.reader.send_command("s\n")
 
             # Start Eye Tracker
             pwd = self._read_pwd()
@@ -1747,18 +1843,20 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.timer.start(PLOT_UPDATE_INTERVAL_MS)
 
     def _cleanup_start_failure(self):
-        if self.sensor_reader:
-            try:
-                self.sensor_reader.stop()
-            except Exception as exc:
-                print(f"Sensor reader cleanup failed: {exc}")
-            self.sensor_reader = None
-        if self.sensor_csv_writer:
-            try:
-                self.sensor_csv_writer.stop()
-            except Exception as exc:
-                print(f"Sensor CSV writer cleanup failed: {exc}")
-            self.sensor_csv_writer = None
+        for channel in self.sensor_channels.values():
+            if channel.reader:
+                try:
+                    channel.reader.stop()
+                except Exception as exc:
+                    print(f"{channel.display_name} reader cleanup failed: {exc}")
+                channel.reader = None
+            if channel.csv_writer:
+                try:
+                    channel.csv_writer.stop()
+                except Exception as exc:
+                    print(f"{channel.display_name} CSV writer cleanup failed: {exc}")
+                channel.csv_writer = None
+        self._stop_audio_recording()
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.system_running = False
@@ -1773,26 +1871,33 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.btn_cal_stop.setEnabled(False)
         self._update_calibration_profile_controls()
 
-        sensor_writer = self.sensor_csv_writer
+        sensor_writers = {
+            role: channel.csv_writer
+            for role, channel in self.sensor_channels.items()
+        }
         eye_writer = self.eye_csv_writer
 
-        # Stop Sensor
-        if self.sensor_reader:
-            try:
-                self.sensor_reader.send_command("e\n")
-            except Exception:
-                pass
-            try:
-                self.sensor_reader.stop()
-            except Exception as exc:
-                print(f"Sensor reader stop failed: {exc}")
-            self.sensor_reader = None
-        if self.sensor_csv_writer:
-            try:
-                self.sensor_csv_writer.stop()
-            except Exception as exc:
-                print(f"Sensor CSV writer stop failed: {exc}")
-            self.sensor_csv_writer = None
+        # Stop Sensors
+        for channel in self.sensor_channels.values():
+            if channel.reader:
+                try:
+                    channel.reader.send_command("e\n")
+                except Exception:
+                    pass
+        for channel in self.sensor_channels.values():
+            if channel.reader:
+                try:
+                    channel.reader.stop()
+                except Exception as exc:
+                    print(f"{channel.display_name} reader stop failed: {exc}")
+                channel.reader = None
+        for channel in self.sensor_channels.values():
+            if channel.csv_writer:
+                try:
+                    channel.csv_writer.stop()
+                except Exception as exc:
+                    print(f"{channel.display_name} CSV writer stop failed: {exc}")
+                channel.csv_writer = None
         
         # Stop Eye
         if self.calibration_is_running:
@@ -1816,9 +1921,12 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         audio_recorder = self._stop_audio_recording()
         
         print("\n===== Logging Session Summary =====")
-        print(f"Sensor Total Packets:    {self.sensor_rate_tracker.total_packets}")
-        if sensor_writer:
-            print(f"Sensor Log Output:       {sensor_writer.output_file}")
+        for role in SENSOR_ROLES:
+            channel = self.sensor_channels[role]
+            print(f"{channel.display_name} Sensor Packets: {channel.rate_tracker.total_packets}")
+            writer = sensor_writers.get(role)
+            if writer:
+                print(f"{channel.display_name} Log Output:    {writer.output_file}")
         print(f"Eye Tracker Data Frames: {self.eye_packet_count}")
         if eye_writer:
             print(f"Eye Tracker Log Output:  {eye_writer.output_file}")
@@ -1834,26 +1942,9 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         now_ms = time.perf_counter() * 1000
         self._process_preview_frames()
 
-        # Drain Sensor
-        if self.sensor_reader:
-            red_b, ir_b, green_b, ax_b, ay_b, az_b, gx_b, gy_b, gz_b, mx_b, my_b, mz_b = ([] for _ in range(12))
-            while True:
-                try: p = self.sensor_reader.packet_queue.get_nowait()
-                except queue.Empty: break
-
-                self.sensor_rate_tracker.push(p["pc_arrival_timestamp"])
-                red_b.append(p["red"]); ir_b.append(p["ir"]); green_b.append(p["green"])
-                ax_b.append(p["ax"]); ay_b.append(p["ay"]); az_b.append(p["az"])
-                gx_b.append(p["gx"]); gy_b.append(p["gy"]); gz_b.append(p["gz"])
-                mx_b.append(p["mx"]); my_b.append(p["my"]); mz_b.append(p["mz"])
-                self.sensor_latest_temp = p["temp"]
-                if self.sensor_csv_writer:
-                    self.sensor_csv_writer.push(p)
-            if red_b:
-                self.sensor_buffers.red.append(red_b); self.sensor_buffers.ir.append(ir_b); self.sensor_buffers.green.append(green_b)
-                self.sensor_buffers.ax.append(ax_b); self.sensor_buffers.ay.append(ay_b); self.sensor_buffers.az.append(az_b)
-                self.sensor_buffers.gx.append(gx_b); self.sensor_buffers.gy.append(gy_b); self.sensor_buffers.gz.append(gz_b)
-                self.sensor_buffers.mx.append(mx_b); self.sensor_buffers.my.append(my_b); self.sensor_buffers.mz.append(mz_b)
+        # Drain Sensors
+        for channel in self.sensor_channels.values():
+            self._drain_sensor_channel(channel)
 
         # Drain Eye
         if self.eye_sdk_running:
@@ -1873,10 +1964,8 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
                 self.eye_mag_x_series.append([s.get("mag_x", 0.0)])
                 self.eye_mag_y_series.append([s.get("mag_y", 0.0)])
                 self.eye_mag_z_series.append([s.get("mag_z", 0.0)])
-                gyro_timestamp = s.get("gyro_timestamp")
-                if gyro_timestamp and gyro_timestamp != self._last_eye_gyro_timestamp:
-                    self._last_eye_gyro_timestamp = gyro_timestamp
-                    self.eye_gyro_rate_tracker.push(s["pc_arrival_timestamp"])
+                if "gyro_x" in s and "accel_x" in s and "mag_x" in s:
+                    self.eye_imu_rate_tracker.push(s["pc_arrival_timestamp"])
                 if self.eye_csv_writer: self.eye_csv_writer.push(s)
             if last_eye_sample:
                 self._display_gaze_data(last_eye_sample["gaze_x"], last_eye_sample["gaze_y"])
@@ -1902,17 +1991,37 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
             self.last_metric_update_ms = now_ms
             self._update_metrics()
 
+    def _drain_sensor_channel(self, channel):
+        if not channel.reader:
+            return
+
+        red_b, ir_b, green_b, ax_b, ay_b, az_b, gx_b, gy_b, gz_b, mx_b, my_b, mz_b = ([] for _ in range(12))
+        while True:
+            try:
+                p = channel.reader.packet_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            channel.rate_tracker.push(p["pc_arrival_timestamp"])
+            red_b.append(p["red"]); ir_b.append(p["ir"]); green_b.append(p["green"])
+            ax_b.append(p["ax"]); ay_b.append(p["ay"]); az_b.append(p["az"])
+            gx_b.append(p["gx"]); gy_b.append(p["gy"]); gz_b.append(p["gz"])
+            mx_b.append(p["mx"]); my_b.append(p["my"]); mz_b.append(p["mz"])
+            channel.latest_temp = p["temp"]
+            if channel.csv_writer:
+                channel.csv_writer.push(p)
+
+        if red_b:
+            buffers = channel.buffers
+            buffers.red.append(red_b); buffers.ir.append(ir_b); buffers.green.append(green_b)
+            buffers.ax.append(ax_b); buffers.ay.append(ay_b); buffers.az.append(az_b)
+            buffers.gx.append(gx_b); buffers.gy.append(gy_b); buffers.gz.append(gz_b)
+            buffers.mx.append(mx_b); buffers.my.append(my_b); buffers.mz.append(mz_b)
+
     def _update_plots(self):
         # Update Sensor Plots
-        red = self.sensor_buffers.red.ordered()
-        if len(red) > 0:
-            x_sen = self.sensor_buffers.red.x_axis(len(red))
-            self.ppg_curves[0].setData(x_sen, red)
-            self.ppg_curves[1].setData(x_sen, self.sensor_buffers.ir.ordered())
-            self.ppg_curves[2].setData(x_sen, self.sensor_buffers.green.ordered())
-            self.accel_plot[1][0].setData(x_sen, self.sensor_buffers.ax.ordered()); self.accel_plot[1][1].setData(x_sen, self.sensor_buffers.ay.ordered()); self.accel_plot[1][2].setData(x_sen, self.sensor_buffers.az.ordered())
-            self.gyro_plot[1][0].setData(x_sen, self.sensor_buffers.gx.ordered()); self.gyro_plot[1][1].setData(x_sen, self.sensor_buffers.gy.ordered()); self.gyro_plot[1][2].setData(x_sen, self.sensor_buffers.gz.ordered())
-            self.mag_plot[1][0].setData(x_sen, self.sensor_buffers.mx.ordered()); self.mag_plot[1][1].setData(x_sen, self.sensor_buffers.my.ordered()); self.mag_plot[1][2].setData(x_sen, self.sensor_buffers.mz.ordered())
+        for channel in self.sensor_channels.values():
+            self._update_sensor_channel_plots(channel)
 
         # Update Eye Tracker IMU Plots
         eye_accel_x = self.eye_accel_x_series.ordered()
@@ -1928,6 +2037,19 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
             self.eye_mag_plot[1][1].setData(x_eye, self.eye_mag_y_series.ordered())
             self.eye_mag_plot[1][2].setData(x_eye, self.eye_mag_z_series.ordered())
 
+    def _update_sensor_channel_plots(self, channel):
+        buffers = channel.buffers
+        red = buffers.red.ordered()
+        if len(red) == 0:
+            return
+        x_sen = buffers.red.x_axis(len(red))
+        channel.ppg_curves[0].setData(x_sen, red)
+        channel.ppg_curves[1].setData(x_sen, buffers.ir.ordered())
+        channel.ppg_curves[2].setData(x_sen, buffers.green.ordered())
+        channel.accel_plot[1][0].setData(x_sen, buffers.ax.ordered()); channel.accel_plot[1][1].setData(x_sen, buffers.ay.ordered()); channel.accel_plot[1][2].setData(x_sen, buffers.az.ordered())
+        channel.gyro_plot[1][0].setData(x_sen, buffers.gx.ordered()); channel.gyro_plot[1][1].setData(x_sen, buffers.gy.ordered()); channel.gyro_plot[1][2].setData(x_sen, buffers.gz.ordered())
+        channel.mag_plot[1][0].setData(x_sen, buffers.mx.ordered()); channel.mag_plot[1][1].setData(x_sen, buffers.my.ordered()); channel.mag_plot[1][2].setData(x_sen, buffers.mz.ordered())
+
     def _auto_range(self, plot_item, values):
         if len(values) < 8: return
         lower = float(np.percentile(values, 1.0)); upper = float(np.percentile(values, 99.0))
@@ -1939,15 +2061,8 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         plot_item.setYRange(lower - padding, upper + padding, padding=0.0)
 
     def _update_ranges(self):
-        self._auto_range(self.ppg_red_plot, self.sensor_buffers.red.ordered())
-        self._auto_range(self.ppg_ir_plot, self.sensor_buffers.ir.ordered())
-        self._auto_range(self.ppg_green_plot, self.sensor_buffers.green.ordered())
-        acc_s = np.vstack((self.sensor_buffers.ax.ordered(), self.sensor_buffers.ay.ordered(), self.sensor_buffers.az.ordered())).flatten()
-        gyr_s = np.vstack((self.sensor_buffers.gx.ordered(), self.sensor_buffers.gy.ordered(), self.sensor_buffers.gz.ordered())).flatten()
-        mag_s = np.vstack((self.sensor_buffers.mx.ordered(), self.sensor_buffers.my.ordered(), self.sensor_buffers.mz.ordered())).flatten()
-        if len(acc_s) > 0: self._auto_range(self.accel_plot[0].getPlotItem(), acc_s)
-        if len(gyr_s) > 0: self._auto_range(self.gyro_plot[0].getPlotItem(), gyr_s)
-        if len(mag_s) > 0: self._auto_range(self.mag_plot[0].getPlotItem(), mag_s)
+        for channel in self.sensor_channels.values():
+            self._update_sensor_channel_ranges(channel)
         eye_acc_s = np.vstack((self.eye_accel_x_series.ordered(), self.eye_accel_y_series.ordered(), self.eye_accel_z_series.ordered())).flatten()
         eye_gyr_s = np.vstack((self.eye_gyro_x_series.ordered(), self.eye_gyro_y_series.ordered(), self.eye_gyro_z_series.ordered())).flatten()
         eye_mag_s = np.vstack((self.eye_mag_x_series.ordered(), self.eye_mag_y_series.ordered(), self.eye_mag_z_series.ordered())).flatten()
@@ -1955,14 +2070,27 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         if len(eye_gyr_s) > 0: self._auto_range(self.eye_gyro_plot[0].getPlotItem(), eye_gyr_s)
         if len(eye_mag_s) > 0: self._auto_range(self.eye_mag_plot[0].getPlotItem(), eye_mag_s)
 
+    def _update_sensor_channel_ranges(self, channel):
+        buffers = channel.buffers
+        self._auto_range(channel.ppg_plots[0], buffers.red.ordered())
+        self._auto_range(channel.ppg_plots[1], buffers.ir.ordered())
+        self._auto_range(channel.ppg_plots[2], buffers.green.ordered())
+        acc_s = np.vstack((buffers.ax.ordered(), buffers.ay.ordered(), buffers.az.ordered())).flatten()
+        gyr_s = np.vstack((buffers.gx.ordered(), buffers.gy.ordered(), buffers.gz.ordered())).flatten()
+        mag_s = np.vstack((buffers.mx.ordered(), buffers.my.ordered(), buffers.mz.ordered())).flatten()
+        if len(acc_s) > 0: self._auto_range(channel.accel_plot[0].getPlotItem(), acc_s)
+        if len(gyr_s) > 0: self._auto_range(channel.gyro_plot[0].getPlotItem(), gyr_s)
+        if len(mag_s) > 0: self._auto_range(channel.mag_plot[0].getPlotItem(), mag_s)
+
     def _update_metrics(self):
-        self.lbl_sensor_rate.setText(f"Sen Rate: {self.sensor_rate_tracker.current_rate():.1f} Hz")
-        self.lbl_sensor_packets.setText(f"Sen Pkts: {self.sensor_rate_tracker.total_packets}")
-        tval = self.sensor_latest_temp
-        self.lbl_sensor_temp.setText(f"Sen Temp: {tval:.2f}" if tval and tval == tval else "Sen Temp: --")
+        for channel in self.sensor_channels.values():
+            channel.rate_label.setText(f"{channel.display_name} Rate: {channel.rate_tracker.current_rate():.1f} Hz")
+            channel.packets_label.setText(f"{channel.display_name} Pkts: {channel.rate_tracker.total_packets}")
+            tval = channel.latest_temp
+            channel.temp_label.setText(f"{channel.display_name} Temp: {tval:.2f}" if tval and tval == tval else f"{channel.display_name} Temp: --")
         self.lbl_eye_rate.setText(f"Eye Rate: {self.eye_rate_tracker.current_rate():.1f} Hz")
         self.lbl_eye_packets.setText(f"Eye Pkts: {self.eye_packet_count}")
-        self.lbl_eye_gyro_rate.setText(f"Gyro Rate: {self.eye_gyro_rate_tracker.current_rate():.1f} Hz")
+        self.lbl_eye_imu_rate.setText(f"Eye IMU Rate: {self.eye_imu_rate_tracker.current_rate():.1f} Hz")
         self._update_audio_loudness()
 
     def _update_audio_loudness(self):
@@ -1991,7 +2119,6 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
 def parse_args():
     parser = argparse.ArgumentParser()
     add_sdk_root_argument(parser)
-    parser.add_argument("--port", type=str, default="COM5")
     parser.add_argument("--baud", type=int, default=1000000)
     parser.add_argument("--sensor-sample-rate", type=float, default=250.0)
     parser.add_argument("--eye-sample-rate", type=float, default=120.0)

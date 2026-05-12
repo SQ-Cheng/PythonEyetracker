@@ -106,7 +106,7 @@
         "ARDUINO=10607",
         "ARDUINO_NRF52832_FEATHER",
         "ARDUINO_ARCH_NRF52",
-        "ARDUINO_BSP_VERSION=\"1.6.1\"",
+        "ARDUINO_BSP_VERSION=1.6.1",
         "NRF52832_XXAA",
         "NRF52",
         "SOFTDEVICE_PRESENT",
@@ -117,7 +117,8 @@
         "CFG_DEBUG=0",
         "CFG_LOGGER=0",
         "CFG_SYSVIEW=0",
-        "ARDUINO_BSP_VERSION=\\\"1.6.1\\\"\"",
+        "ARDUINO_BSP_VERSION=\\1.6.1\\",
+        "ARDUINO_BSP_VERSION=\"1.6.1",
         "USBCON"
       ],
       "cStandard": "c17",

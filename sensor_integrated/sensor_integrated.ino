@@ -360,7 +360,7 @@ void setup() {
   // Clear data buffer
   memset(sensorData, 0, sizeof(sensorData));
 
-  Serial.println("Sensor board ready.");
+  Serial.println("Ring");
 }
 
 // ===================== Loop =====================
