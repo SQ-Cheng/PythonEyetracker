@@ -45,5 +45,8 @@ PythonScript/aSeeX.log
 眼动仪参考资料/
 TrackerLog/
 
+# Release files
+eyetracker_release/
+
 # Build artifacts
 sensor_integrated/build/

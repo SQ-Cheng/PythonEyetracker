@@ -1497,8 +1497,8 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
     def _profile_dir_from_name(self, profile_name):
         return os.path.join(self.calibration_root, profile_name)
 
-    def _refresh_calibration_profiles(self):
-        current_text = self.combo_calibration_profile.currentText() if hasattr(self, "combo_calibration_profile") else ""
+    def _refresh_calibration_profiles(self, selected_name=None):
+        current_text = selected_name or (self.combo_calibration_profile.currentText() if hasattr(self, "combo_calibration_profile") else "")
         profile_names = []
         if os.path.isdir(self.calibration_root):
             for name in sorted(os.listdir(self.calibration_root)):
@@ -1512,7 +1512,9 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.combo_calibration_profile.blockSignals(True)
         self.combo_calibration_profile.clear()
         self.combo_calibration_profile.addItems(profile_names)
-        if current_text:
+        if current_text and current_text in profile_names:
+            self.combo_calibration_profile.setCurrentIndex(profile_names.index(current_text))
+        elif current_text:
             self.combo_calibration_profile.setCurrentText(current_text)
         elif profile_names:
             self.combo_calibration_profile.setCurrentIndex(0)
@@ -1560,8 +1562,9 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Warning", f"Failed to save calibration profile '{profile_name}': {exc}")
             return
 
-        self.combo_calibration_profile.setCurrentText(profile_name)
-        self._refresh_calibration_profiles()
+        self._refresh_calibration_profiles(selected_name=profile_name)
+        if not self._load_selected_calibration_profile(show_message=False):
+            QtWidgets.QMessageBox.warning(self, "Warning", f"Saved calibration profile '{profile_name}', but failed to attach it to the running eye tracker.")
 
     def _load_profile_from_button(self):
         if not self.eye_sdk_running:
@@ -2126,6 +2129,21 @@ def parse_args():
     parser.add_argument("--window-seconds", type=float, default=DISPLAY_WINDOW_SECONDS)
     return parser.parse_args()
 
+def place_window_on_preferred_screen(window, app):
+    screens = app.screens()
+    if not screens:
+        return
+
+    screen = screens[1] if len(screens) > 1 else (app.primaryScreen() or screens[0])
+    available = screen.availableGeometry()
+    size = window.size()
+
+    width = min(size.width(), available.width())
+    height = min(size.height(), available.height())
+    x = available.x() + max(0, (available.width() - width) // 2)
+    y = available.y() + max(0, (available.height() - height) // 2)
+    window.setGeometry(x, y, width, height)
+
 def main():
     if hasattr(QtCore.Qt, 'AA_EnableHighDpiScaling'):
         QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
@@ -2138,6 +2156,7 @@ def main():
     font.setPointSize(10)
     app.setFont(font)
     window = IntegratedMonitorWindow(args)
+    place_window_on_preferred_screen(window, app)
     window.show()
     sys.exit(app.exec_())
 
