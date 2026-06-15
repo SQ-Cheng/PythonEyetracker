@@ -50,3 +50,6 @@ eyetracker_release/
 
 # Build artifacts
 sensor_integrated/build/
+
+# Test files
+third_test/
