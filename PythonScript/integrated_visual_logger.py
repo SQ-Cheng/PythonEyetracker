@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
 Integrated Visual Logger
 
@@ -44,8 +44,10 @@ from example_paths import (
     LOG_DIR,
     add_sdk_root_argument,
     sdk_config_dir,
+    vr_sdk_bin_dir,
 )
 from sdk_wrapper import wrapper
+from sdk_vr_wrapper import VrWrapper
 
 
 # ===================== Constants =====================
@@ -56,6 +58,10 @@ SYNC_MARKER = bytes([0x55, 0xAA, 0x55, 0xAA])
 SYNC_LEN = 4
 
 DISPLAY_WINDOW_SECONDS = 6.0
+DEFAULT_GLASSES_EYE_SAMPLE_RATE_HZ = 120.0
+# aSeeVR combines both eyes into one packet every ~8.33 ms. The SDK's ~240
+# internal "camera call usercall" count is the sum of per-eye processing calls.
+DEFAULT_VR_BINOCULAR_PACKET_RATE_HZ = 120.0
 PLOT_UPDATE_INTERVAL_MS = 33
 METRIC_UPDATE_INTERVAL_MS = 250
 Y_LIMIT_UPDATE_INTERVAL_MS = 500
@@ -211,6 +217,10 @@ class PacketRateTracker:
         duration = self.timestamps[-1] - self.timestamps[0]
         if duration <= 0: return 0.0
         return (len(self.timestamps) - 1) / duration
+
+    def reset(self):
+        self.timestamps.clear()
+        self.total_packets = 0
 
 
 class RingSeries:
@@ -803,7 +813,9 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
 
         # Data & Buffers
         self.eye_rate_tracker = PacketRateTracker()
+        self.eye_device_rate_tracker = PacketRateTracker()
         self.eye_imu_rate_tracker = PacketRateTracker()
+        self._last_vr_device_timestamp = None
         
         self.sensor_channels = {
             role: SensorChannel(role, args.sensor_sample_rate, args.window_seconds)
@@ -819,6 +831,12 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.eye_mag_x_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
         self.eye_mag_y_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
         self.eye_mag_z_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
+        self.vr_gaze_x_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
+        self.vr_gaze_y_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
+        self.vr_left_pupil_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
+        self.vr_right_pupil_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
+        self.vr_left_openness_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
+        self.vr_right_openness_series = RingSeries(args.eye_sample_rate, args.window_seconds, True)
 
         # Plot loop states
         self.last_plot_update_ms = 0.0
@@ -833,10 +851,16 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self._pending_right_eye_frame = None
 
         # Eye tracker Component
-        self.eye_sdk = wrapper()
-        self.eye_sdk_config_path = os.fspath(sdk_config_dir(args.sdk_root))
-        self.eye_sdk.load_library(self.eye_sdk_config_path)
-        self.eye_sdk.set_ui_handle(self)
+        self.eye_sdk_mode = getattr(args, "eye_sdk", "glasses")
+        self.eye_sdk_vr = None
+        if self.eye_sdk_mode == "vr":
+            self.eye_sdk: wrapper | None = None
+            self._init_vr_sdk()
+        else:
+            self.eye_sdk = wrapper()
+            self.eye_sdk_config_path = os.fspath(sdk_config_dir(args.sdk_root))
+            self.eye_sdk.load_library(self.eye_sdk_config_path)
+            self.eye_sdk.set_ui_handle(self)
         
         self.scene_width, self.scene_height = 1280, 720
         self.eye_sdk_running = False
@@ -854,6 +878,12 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._on_timer)
+
+    def _init_vr_sdk(self):
+        """初始化 VR SDK（不连接，仅加载 DLL）。"""
+        vr_bin = os.fspath(vr_sdk_bin_dir(self.args.vr_sdk_root))
+        self.eye_sdk_vr = VrWrapper()
+        self.eye_sdk_vr.load_library(vr_bin)
 
     def _build_ui(self):
         self.setWindowTitle("Integrated Monitor Platform (Eye Tracker + Sensor)")
@@ -1062,7 +1092,9 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         main_layout.addLayout(content_layout, stretch=1)
 
         # -- Top Content: Eye Tracker Views (Largest Element) --
-        scene_eye_row = QtWidgets.QHBoxLayout()
+        self.glasses_preview_panel = QtWidgets.QWidget()
+        scene_eye_row = QtWidgets.QHBoxLayout(self.glasses_preview_panel)
+        scene_eye_row.setContentsMargins(0, 0, 0, 0)
         
         self.labelSceneImage = SceneImageLabel()
         self.labelSceneImage.connect_customized_slot(self._on_scene_clicked)
@@ -1112,7 +1144,8 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         eyes_col.addStretch()
         scene_eye_row.addLayout(eyes_col, stretch=1)
         
-        content_layout.addLayout(scene_eye_row, stretch=3)
+        if self.eye_sdk_mode == "glasses":
+            content_layout.addWidget(self.glasses_preview_panel, stretch=3)
 
         # -- Bottom Content: Plot Columns --
         plots_row = QtWidgets.QHBoxLayout()
@@ -1137,10 +1170,87 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         eye_wave_column.addWidget(self.eye_gyro_plot[0])
         eye_wave_column.addWidget(self.eye_mag_plot[0])
 
-        plots_row.addWidget(self.sensor_tabs, stretch=3)
-        plots_row.addLayout(eye_wave_column, stretch=1)
+        if self.eye_sdk_mode == "vr":
+            self.vr_gaze_plot = self._create_pg_plot(
+                "VR Gaze Position",
+                "Normalized",
+                ["#4ED1A6", "#FF7F50"],
+                ["X", "Y"],
+                sensor_xlink,
+            )
+            self.vr_pupil_plot = self._create_pg_plot(
+                "VR Pupil Diameter",
+                "mm",
+                ["#9AD1FF", "#FFD166"],
+                ["Left", "Right"],
+                sensor_xlink,
+            )
+            self.vr_openness_plot = self._create_pg_plot(
+                "VR Eye Openness",
+                "Normalized",
+                ["#C77DFF", "#72EFDD"],
+                ["Left", "Right"],
+                sensor_xlink,
+            )
+            self.vr_gaze_plot[0].getPlotItem().setYRange(-0.05, 1.05, padding=0.0)
+            self.vr_openness_plot[0].getPlotItem().setYRange(-0.05, 1.05, padding=0.0)
 
-        content_layout.addLayout(plots_row, stretch=2)
+            vr_eye_column = QtWidgets.QVBoxLayout()
+            vr_eye_column.setSpacing(8)
+            vr_eye_column.addWidget(self.vr_gaze_plot[0])
+            vr_eye_column.addWidget(self.vr_pupil_plot[0])
+            vr_eye_column.addWidget(self.vr_openness_plot[0])
+
+            plots_row.addWidget(self.sensor_tabs, stretch=3)
+            plots_row.addLayout(vr_eye_column, stretch=1)
+        else:
+            plots_row.addWidget(self.sensor_tabs, stretch=3)
+            plots_row.addLayout(eye_wave_column, stretch=1)
+
+        content_layout.addLayout(plots_row, stretch=1)
+
+        # VR 模式：隐藏不可用的 UI 组件
+        if self.eye_sdk_mode == "vr":
+            self._set_vr_ui_mode()
+
+    def _set_vr_ui_mode(self):
+        """隐藏 VR SDK 不支持的预览和标定控件。"""
+        self.lbl_eye_rate.setText("VR Binocular Rate: -- Hz")
+        self.lbl_eye_packets.setText("VR Binocular Pkts: 0")
+        self.lbl_eye_imu_rate.setText(
+            f"VR Nominal: {DEFAULT_VR_BINOCULAR_PACKET_RATE_HZ:.0f} Hz"
+        )
+        self.labelSceneImage.setVisible(False)
+        self.labelLeftEye.setVisible(False)
+        self.labelRightEye.setVisible(False)
+        self.eye_accel_plot[0].setVisible(False)
+        self.eye_gyro_plot[0].setVisible(False)
+        self.eye_mag_plot[0].setVisible(False)
+        self.audio_loudness_bar.setVisible(False)
+        # 查找并隐藏标定相关的 QGroupBox（通过遍历 sidebar）
+        # 由于 sidebar 在构建时未保存引用，这里通过 parent 查找
+        self.btn_cal_start.setVisible(False)
+        self.btn_cal_stop.setVisible(False)
+        self.combo_points.setVisible(False)
+        self.combo_calibration_profile.setVisible(False)
+        self.btn_refresh_profiles.setVisible(False)
+        self.btn_load_profile.setVisible(False)
+        self.btn_save_profile.setVisible(False)
+        self.setWindowTitle("Integrated Monitor Platform (VR Eye + Sensor)")
+
+    def _clear_vr_eye_series(self):
+        for series in (
+            self.vr_gaze_x_series,
+            self.vr_gaze_y_series,
+            self.vr_left_pupil_series,
+            self.vr_right_pupil_series,
+            self.vr_left_openness_series,
+            self.vr_right_openness_series,
+        ):
+            series.clear()
+        for plot in (self.vr_gaze_plot, self.vr_pupil_plot, self.vr_openness_plot):
+            for curve in plot[1]:
+                curve.setData([], [])
 
     def _create_sensor_tab(self, channel):
         tab = QtWidgets.QWidget()
@@ -1253,19 +1363,15 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
 
             detected[identity] = reader
 
-        if duplicate_roles or any(role not in detected for role in SENSOR_ROLES):
+        if duplicate_roles:
             for reader in detected.values():
                 reader.stop()
-            if duplicate_roles:
-                names = ", ".join(SENSOR_DISPLAY_NAMES[role] for role in sorted(duplicate_roles))
-                raise RuntimeError(f"Duplicate sensor identity detected: {names}.")
-            missing = ", ".join(SENSOR_DISPLAY_NAMES[role] for role in SENSOR_ROLES if role not in detected)
-            raise RuntimeError(f"Missing sensor identity: {missing}.")
+            names = ", ".join(SENSOR_DISPLAY_NAMES[role] for role in sorted(duplicate_roles))
+            raise RuntimeError(f"Duplicate sensor identity detected: {names}.")
 
         if hasattr(self, "lbl_sensor_ports"):
-            self.lbl_sensor_ports.setText(
-                f"Ring: {detected['ring'].port}\nWatch: {detected['watch'].port}"
-            )
+            parts = [f"{SENSOR_DISPLAY_NAMES[role]}: {detected[role].port}" for role in SENSOR_ROLES if role in detected]
+            self.lbl_sensor_ports.setText("\n".join(parts) if parts else "No sensors detected")
 
         return detected
 
@@ -1716,6 +1822,48 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         cf.read(os.path.join(self.eye_sdk_config_path, "config.ini"))
         return cf.get("softdog", "pwd", fallback="").encode("utf-8")
 
+    def _start_eye_glasses(self, ts_str):
+        """Glasses SDK 眼动启动逻辑（原逻辑不变）。"""
+        pwd = self._read_pwd()
+        if self.eye_sdk.connect_softdog(pwd) == 0:
+            env = self.combo_env.currentData()
+            res = self.combo_res.currentData()
+            self.scene_width, self.scene_height = (1280, 960) if res == 201 else (1280, 720) if res == 202 else (800, 600) if res == 203 else (1920, 1080)
+
+            if self.eye_sdk.start(env, res, self.scene_width, self.scene_height) == 0:
+                self._on_set_sdk_running(True)
+                self._load_selected_calibration_profile(show_message=False)
+                self.eye_csv_writer = CSVWriterThread(
+                    os.path.join(self.log_dir, f"eye_{ts_str}.csv"),
+                    EYE_COLUMN_NAMES,
+                    format_eye_csv_row,
+                )
+                self.eye_csv_writer.start()
+            else:
+                self._on_set_sdk_running(False)
+                QtWidgets.QMessageBox.warning(self, "Warning", "Eye tracker start failed.")
+        else:
+            self._on_set_sdk_running(False)
+            QtWidgets.QMessageBox.warning(self, "Warning", "Eye tracker dog connect failed.")
+
+    def _start_eye_vr(self, ts_str):
+        """VR SDK 眼动启动逻辑。"""
+        try:
+            self.eye_sdk_vr.connect()
+            self.eye_sdk_vr.start()
+        except Exception as exc:
+            self._on_set_sdk_running(False)
+            QtWidgets.QMessageBox.warning(self, "Warning", f"VR eye tracker start failed:\n{exc}")
+            return
+
+        self._on_set_sdk_running(True)
+        self.eye_csv_writer = CSVWriterThread(
+            os.path.join(self.log_dir, f"eye_{ts_str}.csv"),
+            EYE_COLUMN_NAMES,
+            format_eye_csv_row,
+        )
+        self.eye_csv_writer.start()
+
     def _start_audio_recording(self, ts_str):
         if sd is None:
             QtWidgets.QMessageBox.warning(
@@ -1782,6 +1930,13 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
             channel.csv_writer = None
             channel.reset_data(self.args.sensor_sample_rate, self.args.window_seconds)
         self.eye_sdk_running = False
+        self.eye_rate_tracker.reset()
+        self.eye_device_rate_tracker.reset()
+        self.eye_imu_rate_tracker.reset()
+        self._last_vr_device_timestamp = None
+        self.eye_packet_count = 0
+        if self.eye_sdk_mode == "vr":
+            self._clear_vr_eye_series()
         self.audio_recorder = None
 
         # Prepare Logging Dirs
@@ -1790,6 +1945,8 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         try:
             detected_readers = self._detect_sensor_readers()
             for role in SENSOR_ROLES:
+                if role not in detected_readers:
+                    continue
                 channel = self.sensor_channels[role]
                 channel.reader = detected_readers[role]
                 if channel.reader.serial_port:
@@ -1816,27 +1973,10 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
                     channel.reader.send_command("s\n")
 
             # Start Eye Tracker
-            pwd = self._read_pwd()
-            if self.eye_sdk.connect_softdog(pwd) == 0:
-                env = self.combo_env.currentData()
-                res = self.combo_res.currentData()
-                self.scene_width, self.scene_height = (1280, 960) if res == 201 else (1280, 720) if res == 202 else (800, 600) if res == 203 else (1920, 1080)
-
-                if self.eye_sdk.start(env, res, self.scene_width, self.scene_height) == 0:
-                    self._on_set_sdk_running(True)
-                    self._load_selected_calibration_profile(show_message=False)
-                    self.eye_csv_writer = CSVWriterThread(
-                        os.path.join(self.log_dir, f"eye_{ts_str}.csv"),
-                        EYE_COLUMN_NAMES,
-                        format_eye_csv_row,
-                    )
-                    self.eye_csv_writer.start()
-                else:
-                    self._on_set_sdk_running(False)
-                    QtWidgets.QMessageBox.warning(self, "Warning", "Eye tracker start failed.")
+            if self.eye_sdk_mode == "vr":
+                self._start_eye_vr(ts_str)
             else:
-                self._on_set_sdk_running(False)
-                QtWidgets.QMessageBox.warning(self, "Warning", "Eye tracker dog connect failed.")
+                self._start_eye_glasses(ts_str)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Error", f"Failed to start logging session:\n{exc}")
             self._on_stop_all()
@@ -1903,15 +2043,21 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
                 channel.csv_writer = None
         
         # Stop Eye
-        if self.calibration_is_running:
+        if self.eye_sdk_mode == "glasses":
+            if self.calibration_is_running:
+                try:
+                    self._on_stop_calibration()
+                except Exception as exc:
+                    print(f"Calibration stop failed: {exc}")
             try:
-                self._on_stop_calibration()
+                self.eye_sdk.stop()
             except Exception as exc:
-                print(f"Calibration stop failed: {exc}")
-        try:
-            self.eye_sdk.stop()
-        except Exception as exc:
-            print(f"Eye tracker stop failed: {exc}")
+                print(f"Eye tracker stop failed: {exc}")
+        elif self.eye_sdk_vr is not None:
+            try:
+                self.eye_sdk_vr.disconnect()
+            except Exception as exc:
+                print(f"VR eye tracker disconnect failed: {exc}")
         if self.eye_csv_writer:
             try:
                 self.eye_csv_writer.stop()
@@ -1952,24 +2098,63 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         # Drain Eye
         if self.eye_sdk_running:
             last_eye_sample = None
-            while True:
-                try: s = self.eye_sdk.data_queue.get_nowait()
-                except queue.Empty: break
-                self.eye_rate_tracker.push(s["pc_arrival_timestamp"])
-                self.eye_packet_count += 1
-                last_eye_sample = s
-                self.eye_accel_x_series.append([s.get("accel_x", 0.0)])
-                self.eye_accel_y_series.append([s.get("accel_y", 0.0)])
-                self.eye_accel_z_series.append([s.get("accel_z", 0.0)])
-                self.eye_gyro_x_series.append([s.get("gyro_x", 0.0)])
-                self.eye_gyro_y_series.append([s.get("gyro_y", 0.0)])
-                self.eye_gyro_z_series.append([s.get("gyro_z", 0.0)])
-                self.eye_mag_x_series.append([s.get("mag_x", 0.0)])
-                self.eye_mag_y_series.append([s.get("mag_y", 0.0)])
-                self.eye_mag_z_series.append([s.get("mag_z", 0.0)])
-                if "gyro_x" in s and "accel_x" in s and "mag_x" in s:
-                    self.eye_imu_rate_tracker.push(s["pc_arrival_timestamp"])
-                if self.eye_csv_writer: self.eye_csv_writer.push(s)
+            if self.eye_sdk_mode == "vr":
+                # VR SDK: 数据队列来自 VrWrapper
+                gaze_x_batch = []
+                gaze_y_batch = []
+                left_pupil_batch = []
+                right_pupil_batch = []
+                left_openness_batch = []
+                right_openness_batch = []
+                while True:
+                    try: s = self.eye_sdk_vr.data_queue.get_nowait()
+                    except queue.Empty: break
+                    self.eye_rate_tracker.push(s["pc_arrival_timestamp"])
+                    device_timestamp = int(s["device_timestamp"])
+                    if device_timestamp > 0:
+                        if (
+                            self._last_vr_device_timestamp is not None
+                            and device_timestamp <= self._last_vr_device_timestamp
+                        ):
+                            self.eye_device_rate_tracker.reset()
+                        self.eye_device_rate_tracker.push(device_timestamp / 1_000_000.0)
+                        self._last_vr_device_timestamp = device_timestamp
+                    self.eye_packet_count += 1
+                    last_eye_sample = s
+                    gaze_x_batch.append(s["gaze_x"])
+                    gaze_y_batch.append(s["gaze_y"])
+                    left_pupil_batch.append(s["left_pupil_diameter_mm"])
+                    right_pupil_batch.append(s["right_pupil_diameter_mm"])
+                    left_openness_batch.append(s["left_openness"])
+                    right_openness_batch.append(s["right_openness"])
+                    if self.eye_csv_writer: self.eye_csv_writer.push(s)
+                if gaze_x_batch:
+                    self.vr_gaze_x_series.append(gaze_x_batch)
+                    self.vr_gaze_y_series.append(gaze_y_batch)
+                    self.vr_left_pupil_series.append(left_pupil_batch)
+                    self.vr_right_pupil_series.append(right_pupil_batch)
+                    self.vr_left_openness_series.append(left_openness_batch)
+                    self.vr_right_openness_series.append(right_openness_batch)
+            else:
+                # Glasses SDK: 数据队列来自 self.eye_sdk.data_queue
+                while True:
+                    try: s = self.eye_sdk.data_queue.get_nowait()
+                    except queue.Empty: break
+                    self.eye_rate_tracker.push(s["pc_arrival_timestamp"])
+                    self.eye_packet_count += 1
+                    last_eye_sample = s
+                    self.eye_accel_x_series.append([s.get("accel_x", 0.0)])
+                    self.eye_accel_y_series.append([s.get("accel_y", 0.0)])
+                    self.eye_accel_z_series.append([s.get("accel_z", 0.0)])
+                    self.eye_gyro_x_series.append([s.get("gyro_x", 0.0)])
+                    self.eye_gyro_y_series.append([s.get("gyro_y", 0.0)])
+                    self.eye_gyro_z_series.append([s.get("gyro_z", 0.0)])
+                    self.eye_mag_x_series.append([s.get("mag_x", 0.0)])
+                    self.eye_mag_y_series.append([s.get("mag_y", 0.0)])
+                    self.eye_mag_z_series.append([s.get("mag_z", 0.0)])
+                    if "gyro_x" in s and "accel_x" in s and "mag_x" in s:
+                        self.eye_imu_rate_tracker.push(s["pc_arrival_timestamp"])
+                    if self.eye_csv_writer: self.eye_csv_writer.push(s)
             if last_eye_sample:
                 self._display_gaze_data(last_eye_sample["gaze_x"], last_eye_sample["gaze_y"])
                 self._display_pupil_data(
@@ -2026,19 +2211,30 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         for channel in self.sensor_channels.values():
             self._update_sensor_channel_plots(channel)
 
-        # Update Eye Tracker IMU Plots
-        eye_accel_x = self.eye_accel_x_series.ordered()
-        if len(eye_accel_x) > 0:
-            x_eye = self.eye_accel_x_series.x_axis(len(eye_accel_x))
-            self.eye_accel_plot[1][0].setData(x_eye, eye_accel_x)
-            self.eye_accel_plot[1][1].setData(x_eye, self.eye_accel_y_series.ordered())
-            self.eye_accel_plot[1][2].setData(x_eye, self.eye_accel_z_series.ordered())
-            self.eye_gyro_plot[1][0].setData(x_eye, self.eye_gyro_x_series.ordered())
-            self.eye_gyro_plot[1][1].setData(x_eye, self.eye_gyro_y_series.ordered())
-            self.eye_gyro_plot[1][2].setData(x_eye, self.eye_gyro_z_series.ordered())
-            self.eye_mag_plot[1][0].setData(x_eye, self.eye_mag_x_series.ordered())
-            self.eye_mag_plot[1][1].setData(x_eye, self.eye_mag_y_series.ordered())
-            self.eye_mag_plot[1][2].setData(x_eye, self.eye_mag_z_series.ordered())
+        if self.eye_sdk_mode == "vr":
+            gaze_x = self.vr_gaze_x_series.ordered()
+            if len(gaze_x) > 0:
+                x_eye = self.vr_gaze_x_series.x_axis(len(gaze_x))
+                self.vr_gaze_plot[1][0].setData(x_eye, gaze_x)
+                self.vr_gaze_plot[1][1].setData(x_eye, self.vr_gaze_y_series.ordered())
+                self.vr_pupil_plot[1][0].setData(x_eye, self.vr_left_pupil_series.ordered())
+                self.vr_pupil_plot[1][1].setData(x_eye, self.vr_right_pupil_series.ordered())
+                self.vr_openness_plot[1][0].setData(x_eye, self.vr_left_openness_series.ordered())
+                self.vr_openness_plot[1][1].setData(x_eye, self.vr_right_openness_series.ordered())
+        else:
+            # Update Eye Tracker IMU Plots
+            eye_accel_x = self.eye_accel_x_series.ordered()
+            if len(eye_accel_x) > 0:
+                x_eye = self.eye_accel_x_series.x_axis(len(eye_accel_x))
+                self.eye_accel_plot[1][0].setData(x_eye, eye_accel_x)
+                self.eye_accel_plot[1][1].setData(x_eye, self.eye_accel_y_series.ordered())
+                self.eye_accel_plot[1][2].setData(x_eye, self.eye_accel_z_series.ordered())
+                self.eye_gyro_plot[1][0].setData(x_eye, self.eye_gyro_x_series.ordered())
+                self.eye_gyro_plot[1][1].setData(x_eye, self.eye_gyro_y_series.ordered())
+                self.eye_gyro_plot[1][2].setData(x_eye, self.eye_gyro_z_series.ordered())
+                self.eye_mag_plot[1][0].setData(x_eye, self.eye_mag_x_series.ordered())
+                self.eye_mag_plot[1][1].setData(x_eye, self.eye_mag_y_series.ordered())
+                self.eye_mag_plot[1][2].setData(x_eye, self.eye_mag_z_series.ordered())
 
     def _update_sensor_channel_plots(self, channel):
         buffers = channel.buffers
@@ -2066,12 +2262,20 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
     def _update_ranges(self):
         for channel in self.sensor_channels.values():
             self._update_sensor_channel_ranges(channel)
-        eye_acc_s = np.vstack((self.eye_accel_x_series.ordered(), self.eye_accel_y_series.ordered(), self.eye_accel_z_series.ordered())).flatten()
-        eye_gyr_s = np.vstack((self.eye_gyro_x_series.ordered(), self.eye_gyro_y_series.ordered(), self.eye_gyro_z_series.ordered())).flatten()
-        eye_mag_s = np.vstack((self.eye_mag_x_series.ordered(), self.eye_mag_y_series.ordered(), self.eye_mag_z_series.ordered())).flatten()
-        if len(eye_acc_s) > 0: self._auto_range(self.eye_accel_plot[0].getPlotItem(), eye_acc_s)
-        if len(eye_gyr_s) > 0: self._auto_range(self.eye_gyro_plot[0].getPlotItem(), eye_gyr_s)
-        if len(eye_mag_s) > 0: self._auto_range(self.eye_mag_plot[0].getPlotItem(), eye_mag_s)
+        if self.eye_sdk_mode == "vr":
+            pupil_values = np.concatenate((
+                self.vr_left_pupil_series.ordered(),
+                self.vr_right_pupil_series.ordered(),
+            ))
+            if len(pupil_values) > 0:
+                self._auto_range(self.vr_pupil_plot[0].getPlotItem(), pupil_values)
+        else:
+            eye_acc_s = np.vstack((self.eye_accel_x_series.ordered(), self.eye_accel_y_series.ordered(), self.eye_accel_z_series.ordered())).flatten()
+            eye_gyr_s = np.vstack((self.eye_gyro_x_series.ordered(), self.eye_gyro_y_series.ordered(), self.eye_gyro_z_series.ordered())).flatten()
+            eye_mag_s = np.vstack((self.eye_mag_x_series.ordered(), self.eye_mag_y_series.ordered(), self.eye_mag_z_series.ordered())).flatten()
+            if len(eye_acc_s) > 0: self._auto_range(self.eye_accel_plot[0].getPlotItem(), eye_acc_s)
+            if len(eye_gyr_s) > 0: self._auto_range(self.eye_gyro_plot[0].getPlotItem(), eye_gyr_s)
+            if len(eye_mag_s) > 0: self._auto_range(self.eye_mag_plot[0].getPlotItem(), eye_mag_s)
 
     def _update_sensor_channel_ranges(self, channel):
         buffers = channel.buffers
@@ -2091,9 +2295,18 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
             channel.packets_label.setText(f"{channel.display_name} Pkts: {channel.rate_tracker.total_packets}")
             tval = channel.latest_temp
             channel.temp_label.setText(f"{channel.display_name} Temp: {tval:.2f}" if tval and tval == tval else f"{channel.display_name} Temp: --")
-        self.lbl_eye_rate.setText(f"Eye Rate: {self.eye_rate_tracker.current_rate():.1f} Hz")
-        self.lbl_eye_packets.setText(f"Eye Pkts: {self.eye_packet_count}")
-        self.lbl_eye_imu_rate.setText(f"Eye IMU Rate: {self.eye_imu_rate_tracker.current_rate():.1f} Hz")
+        if self.eye_sdk_mode == "vr":
+            device_rate = self.eye_device_rate_tracker.current_rate()
+            measured_rate = device_rate if device_rate > 0.0 else self.eye_rate_tracker.current_rate()
+            self.lbl_eye_rate.setText(f"VR Binocular Rate: {measured_rate:.1f} Hz")
+            self.lbl_eye_packets.setText(f"VR Binocular Pkts: {self.eye_packet_count}")
+            self.lbl_eye_imu_rate.setText(
+                f"VR Nominal: {DEFAULT_VR_BINOCULAR_PACKET_RATE_HZ:.0f} Hz"
+            )
+        else:
+            self.lbl_eye_rate.setText(f"Eye Rate: {self.eye_rate_tracker.current_rate():.1f} Hz")
+            self.lbl_eye_packets.setText(f"Eye Pkts: {self.eye_packet_count}")
+            self.lbl_eye_imu_rate.setText(f"Eye IMU Rate: {self.eye_imu_rate_tracker.current_rate():.1f} Hz")
         self._update_audio_loudness()
 
     def _update_audio_loudness(self):
@@ -2124,10 +2337,25 @@ def parse_args():
     add_sdk_root_argument(parser)
     parser.add_argument("--baud", type=int, default=1000000)
     parser.add_argument("--sensor-sample-rate", type=float, default=250.0)
-    parser.add_argument("--eye-sample-rate", type=float, default=120.0)
+    parser.add_argument(
+        "--eye-sample-rate",
+        type=float,
+        default=None,
+        help=(
+            "Expected eye packet rate used only to size plot buffers; it does not "
+            "configure the SDK hardware (default: 120 Hz for both SDKs)."
+        ),
+    )
     parser.add_argument("--audio-sample-rate", type=int, default=48000)
     parser.add_argument("--window-seconds", type=float, default=DISPLAY_WINDOW_SECONDS)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.eye_sample_rate is None:
+        args.eye_sample_rate = (
+            DEFAULT_VR_BINOCULAR_PACKET_RATE_HZ
+            if args.eye_sdk == "vr"
+            else DEFAULT_GLASSES_EYE_SAMPLE_RATE_HZ
+        )
+    return args
 
 def place_window_on_preferred_screen(window, app):
     screens = app.screens()

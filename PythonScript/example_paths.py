@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """Shared path helpers for the example scripts."""
 
 from pathlib import Path
@@ -6,7 +6,9 @@ import os
 
 
 SDK_ROOT_ENV_VAR = "ASEE_GLASSES_SDK_ROOT"
-DEFAULT_VENDOR_SDK_ROOT = Path(r"E:/7invensun/aSeeGlassesPlusUserSDK")
+DEFAULT_VENDOR_SDK_ROOT = Path(r"C:/7invensun/aSeeGlassesPlusUserSDK")
+VR_SDK_ROOT_ENV_VAR = "ASEE_VR_SDK_ROOT"
+DEFAULT_VR_VENDOR_SDK_ROOT = Path(r"C:/7invensun/aSeeVR_UserSDK")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SDK_PROJECT_ROOT = SCRIPT_DIR
@@ -29,6 +31,22 @@ def sdk_config_dir(explicit_root=None):
     return resolve_sdk_root(explicit_root) / "bin" / "config"
 
 
+def resolve_vr_sdk_root(explicit_root=None):
+    if explicit_root:
+        return Path(explicit_root).expanduser()
+
+    env_root = os.environ.get(VR_SDK_ROOT_ENV_VAR)
+    if env_root:
+        return Path(env_root).expanduser()
+
+    return DEFAULT_VR_VENDOR_SDK_ROOT
+
+
+def vr_sdk_bin_dir(explicit_root=None):
+    """aSeeVRClient.dll 所在目录。"""
+    return resolve_vr_sdk_root(explicit_root) / "aSeeVRClient" / "bin"
+
+
 def add_sdk_root_argument(parser):
     parser.add_argument(
         "--sdk-root",
@@ -37,4 +55,18 @@ def add_sdk_root_argument(parser):
             "Vendor SDK root directory. Defaults to the value of "
             f"{SDK_ROOT_ENV_VAR} or {DEFAULT_VENDOR_SDK_ROOT}."
         ),
+    )
+    parser.add_argument(
+        "--vr-sdk-root",
+        default=str(resolve_vr_sdk_root()),
+        help=(
+            "VR vendor SDK root directory. Defaults to the value of "
+            f"{VR_SDK_ROOT_ENV_VAR} or {DEFAULT_VR_VENDOR_SDK_ROOT}."
+        ),
+    )
+    parser.add_argument(
+        "--eye-sdk",
+        choices=["glasses", "vr"],
+        default="glasses",
+        help="Eye tracker SDK to use: 'glasses' (aSeeGlassesPlus) or 'vr' (aSeeVR).",
     )
