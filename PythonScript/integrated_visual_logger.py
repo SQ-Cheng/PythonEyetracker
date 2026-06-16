@@ -942,10 +942,19 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         root.addLayout(main_layout, stretch=1)
 
         # ----- Sidebar -----
-        sidebar = QtWidgets.QVBoxLayout()
+        sidebar_container = QtWidgets.QWidget()
+        sidebar_container.setFixedWidth(sidebar_width)
+        sidebar = QtWidgets.QVBoxLayout(sidebar_container)
         sidebar.setContentsMargins(0, 0, 0, 0)
         sidebar.setSpacing(10)
-        main_layout.addLayout(sidebar)
+        self.sidebar_scroll = QtWidgets.QScrollArea()
+        self.sidebar_scroll.setWidget(sidebar_container)
+        self.sidebar_scroll.setWidgetResizable(True)
+        self.sidebar_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.sidebar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.sidebar_scroll.setFixedWidth(sidebar_width + 18)
+        main_layout.addWidget(self.sidebar_scroll, stretch=0)
 
         group_ss = f"QGroupBox {{ border: 1px solid {t['group_border']}; border-radius: 6px; margin-top: 10px; padding-top: 14px; font-weight: bold; color: {t['group_title']}; }} QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; }}"
         btn_ss = f"QPushButton {{ background: {t['btn_bg']}; color: {t['btn_text']}; border: 1px solid {t['group_border']}; border-radius: 5px; padding: 6px 12px; font-size: 10pt; }} QPushButton:hover {{ background: {t['btn_hover']}; }} QPushButton:pressed {{ background: {t['group_border']}; }} QPushButton:disabled {{ background: {t['btn_disabled_bg']}; color: {t['btn_disabled_text']}; }}"
@@ -1022,10 +1031,10 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         sidebar.addWidget(grp_eye)
 
         # Calibration
-        grp_cal = QtWidgets.QGroupBox("Eye Calibration")
-        grp_cal.setStyleSheet(group_ss)
-        grp_cal.setFixedWidth(sidebar_width)
-        lo_cal = QtWidgets.QVBoxLayout(grp_cal)
+        self.grp_calibration = QtWidgets.QGroupBox("Eye Calibration")
+        self.grp_calibration.setStyleSheet(group_ss)
+        self.grp_calibration.setFixedWidth(sidebar_width)
+        lo_cal = QtWidgets.QVBoxLayout(self.grp_calibration)
         self.combo_points = QtWidgets.QComboBox()
         self.combo_points.setStyleSheet(combo_ss)
         self.combo_points.addItems(["1", "3", "5", "9"])
@@ -1040,12 +1049,12 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         _lbl_points.setStyleSheet(sidebar_label_ss)
         lo_cal.addWidget(_lbl_points); lo_cal.addWidget(self.combo_points)
         lo_cal.addWidget(self.btn_cal_start); lo_cal.addWidget(self.btn_cal_stop)
-        sidebar.addWidget(grp_cal)
+        sidebar.addWidget(self.grp_calibration)
 
-        grp_profiles = QtWidgets.QGroupBox("Calibration Profile")
-        grp_profiles.setStyleSheet(group_ss)
-        grp_profiles.setFixedWidth(sidebar_width)
-        lo_profiles = QtWidgets.QVBoxLayout(grp_profiles)
+        self.grp_calibration_profile = QtWidgets.QGroupBox("Calibration Profile")
+        self.grp_calibration_profile.setStyleSheet(group_ss)
+        self.grp_calibration_profile.setFixedWidth(sidebar_width)
+        lo_profiles = QtWidgets.QVBoxLayout(self.grp_calibration_profile)
         self.combo_calibration_profile = QtWidgets.QComboBox()
         self.combo_calibration_profile.setStyleSheet(combo_ss)
         self.combo_calibration_profile.setEditable(True)
@@ -1059,7 +1068,7 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         lo_profiles.addWidget(self.btn_refresh_profiles)
         lo_profiles.addWidget(self.btn_load_profile)
         lo_profiles.addWidget(self.btn_save_profile)
-        sidebar.addWidget(grp_profiles)
+        sidebar.addWidget(self.grp_calibration_profile)
         self._refresh_calibration_profiles()
         
         # Realtime Values
@@ -1215,11 +1224,9 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
 
     def _set_vr_ui_mode(self):
         """隐藏 VR SDK 不支持的预览和标定控件。"""
-        self.lbl_eye_rate.setText("VR Binocular Rate: -- Hz")
-        self.lbl_eye_packets.setText("VR Binocular Pkts: 0")
-        self.lbl_eye_imu_rate.setText(
-            f"VR Nominal: {DEFAULT_VR_BINOCULAR_PACKET_RATE_HZ:.0f} Hz"
-        )
+        self.lbl_eye_rate.setText("Eye Tracker FPS: -- Hz")
+        self.lbl_eye_packets.setText("Eye Tracker Pkts: 0")
+        self.lbl_eye_imu_rate.setVisible(False)
         self.labelSceneImage.setVisible(False)
         self.labelLeftEye.setVisible(False)
         self.labelRightEye.setVisible(False)
@@ -1227,15 +1234,8 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.eye_gyro_plot[0].setVisible(False)
         self.eye_mag_plot[0].setVisible(False)
         self.audio_loudness_bar.setVisible(False)
-        # 查找并隐藏标定相关的 QGroupBox（通过遍历 sidebar）
-        # 由于 sidebar 在构建时未保存引用，这里通过 parent 查找
-        self.btn_cal_start.setVisible(False)
-        self.btn_cal_stop.setVisible(False)
-        self.combo_points.setVisible(False)
-        self.combo_calibration_profile.setVisible(False)
-        self.btn_refresh_profiles.setVisible(False)
-        self.btn_load_profile.setVisible(False)
-        self.btn_save_profile.setVisible(False)
+        self.grp_calibration.setVisible(False)
+        self.grp_calibration_profile.setVisible(False)
         self.setWindowTitle("Integrated Monitor Platform (VR Eye + Sensor)")
 
     def _clear_vr_eye_series(self):
@@ -2298,11 +2298,8 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         if self.eye_sdk_mode == "vr":
             device_rate = self.eye_device_rate_tracker.current_rate()
             measured_rate = device_rate if device_rate > 0.0 else self.eye_rate_tracker.current_rate()
-            self.lbl_eye_rate.setText(f"VR Binocular Rate: {measured_rate:.1f} Hz")
-            self.lbl_eye_packets.setText(f"VR Binocular Pkts: {self.eye_packet_count}")
-            self.lbl_eye_imu_rate.setText(
-                f"VR Nominal: {DEFAULT_VR_BINOCULAR_PACKET_RATE_HZ:.0f} Hz"
-            )
+            self.lbl_eye_rate.setText(f"Eye Tracker FPS: {measured_rate:.1f} Hz")
+            self.lbl_eye_packets.setText(f"Eye Tracker Pkts: {self.eye_packet_count}")
         else:
             self.lbl_eye_rate.setText(f"Eye Rate: {self.eye_rate_tracker.current_rate():.1f} Hz")
             self.lbl_eye_packets.setText(f"Eye Pkts: {self.eye_packet_count}")
