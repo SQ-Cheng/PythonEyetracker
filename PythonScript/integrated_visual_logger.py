@@ -852,6 +852,8 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
 
         # Eye tracker Component
         self.eye_sdk_mode = getattr(args, "eye_sdk", "glasses")
+        if self.eye_sdk_mode == "vr":
+            self.sensor_channels["watch"].display_name = "Head"
         self.eye_sdk_vr = None
         if self.eye_sdk_mode == "vr":
             self.eye_sdk: wrapper | None = None
@@ -885,6 +887,20 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.eye_sdk_vr = VrWrapper()
         self.eye_sdk_vr.load_library(vr_bin)
 
+    def _sensor_display_name(self, role):
+        return self.sensor_channels[role].display_name
+
+    def _sensor_log_prefix(self, role):
+        if self.eye_sdk_mode == "vr":
+            return "head_sensor" if role == "watch" else f"{role}_sensor"
+        return role
+
+    def _eye_log_prefix(self):
+        return "eye_tracking" if self.eye_sdk_mode == "vr" else "eye"
+
+    def _audio_log_prefix(self):
+        return "mic_capture" if self.eye_sdk_mode == "vr" else "audio"
+
     def _build_ui(self):
         self.setWindowTitle("Integrated Monitor Platform (Eye Tracker + Sensor)")
         self.resize(1600, 1000)
@@ -914,9 +930,10 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         self.lbl_ring_rate = QtWidgets.QLabel("Ring Rate: -- Hz")
         self.lbl_ring_packets = QtWidgets.QLabel("Ring Pkts: 0")
         self.lbl_ring_temp = QtWidgets.QLabel("Ring Temp: --")
-        self.lbl_watch_rate = QtWidgets.QLabel("Watch Rate: -- Hz")
-        self.lbl_watch_packets = QtWidgets.QLabel("Watch Pkts: 0")
-        self.lbl_watch_temp = QtWidgets.QLabel("Watch Temp: --")
+        watch_display_name = self._sensor_display_name("watch")
+        self.lbl_watch_rate = QtWidgets.QLabel(f"{watch_display_name} Rate: -- Hz")
+        self.lbl_watch_packets = QtWidgets.QLabel(f"{watch_display_name} Pkts: 0")
+        self.lbl_watch_temp = QtWidgets.QLabel(f"{watch_display_name} Temp: --")
         self.sensor_channels["ring"].rate_label = self.lbl_ring_rate
         self.sensor_channels["ring"].packets_label = self.lbl_ring_packets
         self.sensor_channels["ring"].temp_label = self.lbl_ring_temp
@@ -977,7 +994,7 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         grp_sensor.setStyleSheet(group_ss)
         grp_sensor.setFixedWidth(sidebar_width)
         lo_sensor = QtWidgets.QVBoxLayout(grp_sensor)
-        self.lbl_sensor_ports = QtWidgets.QLabel("Auto-detect Ring + Watch")
+        self.lbl_sensor_ports = QtWidgets.QLabel(f"Auto-detect Ring + {watch_display_name}")
         self.lbl_sensor_ports.setStyleSheet(sidebar_label_ss)
         self.lbl_sensor_ports.setWordWrap(True)
         self.combo_baud = QtWidgets.QComboBox()
@@ -1315,11 +1332,12 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
     def _populate_sensor_ports(self):
         matched_ports = self._candidate_sensor_ports()
         if hasattr(self, "lbl_sensor_ports"):
+            watch_display_name = self._sensor_display_name("watch")
             if matched_ports:
                 ports_text = ", ".join(port.device for port in matched_ports)
-                self.lbl_sensor_ports.setText(f"Auto-detect Ring + Watch\nCandidates: {ports_text}")
+                self.lbl_sensor_ports.setText(f"Auto-detect Ring + {watch_display_name}\nCandidates: {ports_text}")
             else:
-                self.lbl_sensor_ports.setText("Auto-detect Ring + Watch\nNo candidate ports")
+                self.lbl_sensor_ports.setText(f"Auto-detect Ring + {watch_display_name}\nNo candidate ports")
         return matched_ports
 
     def _candidate_sensor_ports(self):
@@ -1366,11 +1384,11 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         if duplicate_roles:
             for reader in detected.values():
                 reader.stop()
-            names = ", ".join(SENSOR_DISPLAY_NAMES[role] for role in sorted(duplicate_roles))
+            names = ", ".join(self._sensor_display_name(role) for role in sorted(duplicate_roles))
             raise RuntimeError(f"Duplicate sensor identity detected: {names}.")
 
         if hasattr(self, "lbl_sensor_ports"):
-            parts = [f"{SENSOR_DISPLAY_NAMES[role]}: {detected[role].port}" for role in SENSOR_ROLES if role in detected]
+            parts = [f"{self._sensor_display_name(role)}: {detected[role].port}" for role in SENSOR_ROLES if role in detected]
             self.lbl_sensor_ports.setText("\n".join(parts) if parts else "No sensors detected")
 
         return detected
@@ -1858,7 +1876,7 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
 
         self._on_set_sdk_running(True)
         self.eye_csv_writer = CSVWriterThread(
-            os.path.join(self.log_dir, f"eye_{ts_str}.csv"),
+            os.path.join(self.log_dir, f"{self._eye_log_prefix()}_{ts_str}.csv"),
             EYE_COLUMN_NAMES,
             format_eye_csv_row,
         )
@@ -1882,9 +1900,10 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Warning", "No supported audio sample rate is selected.")
             return False
 
-        wav_file = os.path.join(self.log_dir, f"audio_{ts_str}.wav")
-        timestamp_file = os.path.join(self.log_dir, f"audio_{ts_str}_timestamps.csv")
-        metadata_file = os.path.join(self.log_dir, f"audio_{ts_str}_metadata.json")
+        audio_log_prefix = self._audio_log_prefix()
+        wav_file = os.path.join(self.log_dir, f"{audio_log_prefix}_{ts_str}.wav")
+        timestamp_file = os.path.join(self.log_dir, f"{audio_log_prefix}_{ts_str}_timestamps.csv")
+        metadata_file = os.path.join(self.log_dir, f"{audio_log_prefix}_{ts_str}_metadata.json")
         recorder = AudioRecorder(
             device_index=device_index,
             device_name=self.combo_audio_device.currentText(),
@@ -1955,7 +1974,7 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
                 channel.reader._buffer.clear()
                 channel.reader._text_buffer.clear()
                 channel.csv_writer = CSVWriterThread(
-                    os.path.join(self.log_dir, f"{role}_{ts_str}.csv"),
+                    os.path.join(self.log_dir, f"{self._sensor_log_prefix(role)}_{ts_str}.csv"),
                     SENSOR_COLUMN_NAMES,
                     format_sensor_csv_row,
                 )
