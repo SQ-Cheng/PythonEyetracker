@@ -520,7 +520,8 @@ class AudioRecorder:
             dtype=AUDIO_DTYPE,
         )
         self.started_pc_perf_timestamp = time.perf_counter()
-        self._writer_thread.start()
+        # 先创建并启动音频流，确保流正常工作后才启动 writer 线程，
+        # 避免流启动失败时已打开空 WAV 文件
         try:
             self._stream = sd.InputStream(
                 device=self.device_index,
@@ -537,9 +538,20 @@ class AudioRecorder:
                 except Exception:
                     pass
                 self._stream = None
-            self._stop_event.set()
-            self._writer_thread.join(timeout=2.0)
             raise
+        # 流已就绪，再启动 writer 线程（此时数据会积压在队列中，writer 会追上）
+        self._writer_thread.start()
+
+    def _cleanup_empty_wav(self):
+        """若 WAV 文件无有效帧数据则删除，避免留下 0 秒录音。"""
+        if self.frames_written > 0:
+            return
+        for path in (self.wav_file, self.timestamp_file, self.metadata_file):
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except Exception:
+                pass
 
     def stop(self):
         if self._stream is not None:
@@ -551,10 +563,12 @@ class AudioRecorder:
 
         self.stopped_pc_perf_timestamp = time.perf_counter()
         self._stop_event.set()
-        self._writer_thread.join(timeout=5.0)
+        self._writer_thread.join(timeout=10.0)
         if self._writer_thread.is_alive():
             self.error = self.error or "audio writer did not finish flushing"
         self._write_metadata()
+        # 无有效帧数据时清理空文件
+        self._cleanup_empty_wav()
         if self.error:
             raise RuntimeError(f"Audio writer failed: {self.error}")
 
@@ -1916,6 +1930,13 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         try:
             recorder.start()
         except Exception as exc:
+            # 启动失败时清理可能已创建的空 WAV 文件
+            for f in (wav_file, timestamp_file, metadata_file):
+                try:
+                    if os.path.isfile(f):
+                        os.remove(f)
+                except Exception:
+                    pass
             QtWidgets.QMessageBox.warning(self, "Warning", f"Audio recording failed to start:\n{exc}")
             return False
 
