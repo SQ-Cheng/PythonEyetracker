@@ -33,6 +33,8 @@ import threading
 import time
 from pathlib import Path
 
+from example_paths import resolve_vr_sdk_root
+
 
 SUCCESS = 0
 
@@ -75,6 +77,13 @@ class ASeeVRInitParam(C.Structure):
     ]
 
 
+class ASeeVRLanuchParam(C.Structure):
+    _fields_ = [
+        ("enable_iris", C.c_int32),
+        ("eye", C.c_int32),
+    ]
+
+
 class ASeeVRCoefficient(C.Structure):
     _fields_ = [
         ("buf", C.c_uint8 * 2048),
@@ -82,6 +91,7 @@ class ASeeVRCoefficient(C.Structure):
 
 
 STATE_CALLBACK = C.WINFUNCTYPE(None, C.POINTER(ASeeVRState), C.c_void_p)
+EYE_DATA_CALLBACK = C.WINFUNCTYPE(None, C.c_void_p, C.c_void_p)
 IMAGE_CALLBACK = C.WINFUNCTYPE(None, C.POINTER(ASeeVRImage), C.c_void_p)
 COEFFICIENT_CALLBACK = C.WINFUNCTYPE(None, C.POINTER(ASeeVRCoefficient), C.c_void_p)
 
@@ -189,13 +199,26 @@ def main() -> int:
     parser.add_argument(
         "--sdk-root",
         type=Path,
-        default=Path(r"E:\7invensun\aSeeVR_UserSDK"),
+        default=resolve_vr_sdk_root(),
         help="Root folder of aSeeVR_UserSDK.",
     )
     parser.add_argument("--port", type=int, default=5777)
     parser.add_argument("--max-frames", type=int, default=20)
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--coefficient-timeout", type=float, default=5.0)
+    parser.add_argument("--enable-iris", action="store_true")
+    parser.add_argument(
+        "--eye-mode",
+        type=int,
+        choices=(1, 2, 3),
+        default=3,
+        help="aSeeVRLanuchParam.eye: 1=left, 2=right, 3=binocular.",
+    )
+    parser.add_argument(
+        "--no-launch-param",
+        action="store_true",
+        help="Call aSeeVR_start(coefficient, NULL), matching the vendor C++ demo.",
+    )
     parser.add_argument(
         "--max-frame-bytes",
         type=int,
@@ -217,6 +240,10 @@ def main() -> int:
     done = threading.Event()
     coefficient_ready = threading.Event()
     coefficient = ASeeVRCoefficient()
+    counters = {
+        "eye_data": 0,
+        "eye_image": 0,
+    }
 
     # Keep callback objects alive for the entire SDK session.
     callbacks = []
@@ -237,14 +264,31 @@ def main() -> int:
         coefficient_ready.set()
         print("coefficient callback: received 2048 bytes")
 
+    def on_eye_data(eye_data_ptr: C.c_void_p, context: int) -> None:
+        if not eye_data_ptr:
+            return
+        counters["eye_data"] += 1
+        if counters["eye_data"] <= 3:
+            print(f"eye data callback: count={counters['eye_data']}")
+
     def on_eye_image(image_ptr: C.POINTER(ASeeVRImage), context: int) -> None:
         if done.is_set() or not image_ptr:
             return
 
+        counters["eye_image"] += 1
         image = image_ptr.contents
         width = int(image.width)
         height = int(image.height)
         expected_size = width * height
+        if counters["eye_image"] <= 3:
+            print(
+                "eye image callback:",
+                f"count={counters['eye_image']}",
+                f"flag={image.flag}",
+                f"width={width}",
+                f"height={height}",
+                f"timestamp={image.timestamp}",
+            )
 
         if width <= 0 or height <= 0 or expected_size > args.max_frame_bytes:
             print(
@@ -269,9 +313,10 @@ def main() -> int:
         frames.put((int(image.flag), width, height, int(image.timestamp), frame_bytes))
 
     state_cb = STATE_CALLBACK(on_state)
+    eye_data_cb = EYE_DATA_CALLBACK(on_eye_data)
     coeff_cb = COEFFICIENT_CALLBACK(on_coefficient)
     image_cb = IMAGE_CALLBACK(on_eye_image)
-    callbacks.extend([state_cb, coeff_cb, image_cb])
+    callbacks.extend([state_cb, eye_data_cb, coeff_cb, image_cb])
 
     writer = threading.Thread(
         target=frame_writer,
@@ -296,6 +341,7 @@ def main() -> int:
 
         registrations = [
             (CALLBACK_STATE, state_cb),
+            (CALLBACK_EYE_DATA, eye_data_cb),
             (CALLBACK_EYE_IMAGE, image_cb),
             (CALLBACK_COEFFICIENT, coeff_cb),
         ]
@@ -318,7 +364,11 @@ def main() -> int:
             print("No coefficient callback received before timeout.")
             return 5
 
-        ret = dll.aSeeVR_start(C.byref(coefficient), None)
+        launch = ASeeVRLanuchParam()
+        launch.enable_iris = 1 if args.enable_iris else 0
+        launch.eye = args.eye_mode
+        launch_ptr = None if args.no_launch_param else C.byref(launch)
+        ret = dll.aSeeVR_start(C.byref(coefficient), launch_ptr)
         print(f"aSeeVR_start -> {ret}")
         if ret != SUCCESS:
             return 6
@@ -330,6 +380,11 @@ def main() -> int:
 
         done.set()
         writer.join(timeout=2.0)
+        print(
+            "callback counts:",
+            f"eye_data={counters['eye_data']}",
+            f"eye_image={counters['eye_image']}",
+        )
         print(f"frames written to: {args.output_dir}")
         return 0
 
