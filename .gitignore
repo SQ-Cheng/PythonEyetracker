@@ -57,3 +57,14 @@ third_test/
 
 # Mechanical design files
 Mechanics/
+
+# Probe/test output directories (keep only .py and .ps1)
+PythonScript/aseevr_*/
+PythonScript/usersdk_*/
+
+# Top-level reports (not code)
+/ASEEVR_*.md
+/USERSDK_*.md
+
+# SDK binary files
+*.bin
