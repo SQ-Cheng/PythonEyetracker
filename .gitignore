@@ -61,6 +61,10 @@ Mechanics/
 # Probe/test output directories (keep only .py and .ps1)
 PythonScript/aseevr_*/
 PythonScript/usersdk_*/
+PythonScript/cv2_*/
+PythonScript/alginterface*/
+PythonScript/hires*
+PythonScript/*image*
 
 # Top-level reports (not code)
 /ASEEVR_*.md

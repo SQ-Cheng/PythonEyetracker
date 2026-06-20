@@ -47,7 +47,7 @@ from example_paths import (
     vr_sdk_bin_dir,
 )
 from sdk_wrapper import wrapper
-from sdk_vr_wrapper import VrWrapper
+from sdk_vr_usersdk_wrapper import VrUserSdkWrapper
 
 
 # ===================== Constants =====================
@@ -898,7 +898,7 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
     def _init_vr_sdk(self):
         """初始化 VR SDK（不连接，仅加载 DLL）。"""
         vr_bin = os.fspath(vr_sdk_bin_dir(self.args.vr_sdk_root))
-        self.eye_sdk_vr = VrWrapper()
+        self.eye_sdk_vr = VrUserSdkWrapper()
         self.eye_sdk_vr.load_library(vr_bin)
 
     def _sensor_display_name(self, role):
@@ -1186,6 +1186,36 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
         
         if self.eye_sdk_mode == "glasses":
             content_layout.addWidget(self.glasses_preview_panel, stretch=3)
+        else:
+            self.vr_preview_panel = QtWidgets.QWidget()
+            vr_preview_row = QtWidgets.QHBoxLayout(self.vr_preview_panel)
+            vr_preview_row.setContentsMargins(0, 0, 0, 0)
+            vr_preview_row.setSpacing(8)
+
+            self.labelLeftEye.setMinimumSize(320, 240)
+            self.labelLeftEye.setMaximumWidth(16777215)
+            self.labelRightEye.setMinimumSize(320, 240)
+            self.labelRightEye.setMaximumWidth(16777215)
+            self.audio_loudness_bar.setMaximumWidth(16777215)
+
+            vr_left_title = QtWidgets.QLabel("Left Eye")
+            vr_left_title.setStyleSheet(eye_title_ss)
+            vr_left_title.setAlignment(Qt.AlignCenter)
+            vr_right_title = QtWidgets.QLabel("Right Eye")
+            vr_right_title.setStyleSheet(eye_title_ss)
+            vr_right_title.setAlignment(Qt.AlignCenter)
+
+            vr_left_col = QtWidgets.QVBoxLayout()
+            vr_left_col.addWidget(vr_left_title)
+            vr_left_col.addWidget(self.labelLeftEye, stretch=1)
+            vr_right_col = QtWidgets.QVBoxLayout()
+            vr_right_col.addWidget(vr_right_title)
+            vr_right_col.addWidget(self.labelRightEye, stretch=1)
+            vr_right_col.addWidget(self.audio_loudness_bar)
+
+            vr_preview_row.addLayout(vr_left_col, stretch=1)
+            vr_preview_row.addLayout(vr_right_col, stretch=1)
+            content_layout.addWidget(self.vr_preview_panel, stretch=2)
 
         # -- Bottom Content: Plot Columns --
         plots_row = QtWidgets.QHBoxLayout()
@@ -1254,17 +1284,17 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
             self._set_vr_ui_mode()
 
     def _set_vr_ui_mode(self):
-        """隐藏 VR SDK 不支持的预览和标定控件。"""
+        """Apply VR-specific UI state."""
         self.lbl_eye_rate.setText("Eye Tracker FPS: -- Hz")
         self.lbl_eye_packets.setText("Eye Tracker Pkts: 0")
         self.lbl_eye_imu_rate.setVisible(False)
         self.labelSceneImage.setVisible(False)
-        self.labelLeftEye.setVisible(False)
-        self.labelRightEye.setVisible(False)
+        self.labelLeftEye.setVisible(True)
+        self.labelRightEye.setVisible(True)
         self.eye_accel_plot[0].setVisible(False)
         self.eye_gyro_plot[0].setVisible(False)
         self.eye_mag_plot[0].setVisible(False)
-        self.audio_loudness_bar.setVisible(False)
+        self.audio_loudness_bar.setVisible(True)
         self.grp_calibration.setVisible(False)
         self.grp_calibration_profile.setVisible(False)
         self.setWindowTitle("Integrated Monitor Platform (VR Eye + Sensor)")
@@ -1762,11 +1792,33 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
     def _display_eye_preview_frame(self, label, frame):
         frame_bytes, width, height, _device_timestamp, _pc_arrival_timestamp = frame
         try:
-            image = QImage(frame_bytes, int(width), int(height), QImage.Format_Indexed8)
-            pixmap = QPixmap.fromImage(image.scaled(160, 120, Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
+            image_format = getattr(QImage, "Format_Grayscale8", QImage.Format_Indexed8)
+            image = QImage(frame_bytes, int(width), int(height), int(width), image_format).copy()
+            pixmap = QPixmap.fromImage(image)
             label.setPixmap(pixmap)
         except Exception as exc:
             print(f"Eye preview update failed: {exc}")
+
+    def _drain_vr_eye_images(self):
+        if self.eye_sdk_mode != "vr" or not self.eye_sdk_vr:
+            return
+        image_queue = getattr(self.eye_sdk_vr, "image_queue", None)
+        if image_queue is None:
+            return
+
+        while True:
+            try:
+                frame = image_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.handle_eye_preview_frame(
+                frame.eye,
+                frame.data,
+                frame.width,
+                frame.height,
+                frame.device_timestamp,
+                frame.pc_arrival_timestamp,
+            )
 
     def _display_scene_image(self, image):
         painter = QPainter(image)
@@ -2129,6 +2181,8 @@ class IntegratedMonitorWindow(QtWidgets.QMainWindow):
     # ---- Timer Update ----
     def _on_timer(self):
         now_ms = time.perf_counter() * 1000
+        if self.eye_sdk_mode == "vr":
+            self._drain_vr_eye_images()
         self._process_preview_frames()
 
         # Drain Sensors
